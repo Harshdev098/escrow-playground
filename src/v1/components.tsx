@@ -12,10 +12,8 @@ import {
     relaySignatureFields,
     arbiterRelayFields,
     buildPacket,
-    TRUST_TABLE,
     TRUST_ASSUMPTIONS,
     NOT_REQUIRED,
-    ARCHITECTURE_ESSAY,
 } from "./domain";
 import type {
     EscrowState,
@@ -203,7 +201,7 @@ function StageNode({ party, highlighted }: { party: PartyId; highlighted: boolea
     );
 }
 
-function FlightMarker({ packet, phase }: { packet: PacketInstance; phase: "out" | "back" | null }) {
+function FlightMarker({ packet }: { packet: PacketInstance; phase: "out" | "back" | null }) {
     const tone =
         packet.status === "accepted" ? "var(--color-success)" : packet.status === "rejected" ? "var(--color-danger)" : "var(--color-primary)";
     return (
