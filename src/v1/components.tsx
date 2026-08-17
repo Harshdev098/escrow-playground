@@ -152,9 +152,8 @@ export function UnderstandTab({ goTo }: { goTo: (id: TabId) => void }) {
                 {expanded && (
                     <div className="expander__body">
                         <p>
-                            Fedimint is a way for a group of operators (a "federation") to
-                            custody Bitcoin together instead of any single party holding it. Users get a private, chargeback-free
-                            digital cash (ecash) backed by that federation. No single operator can move your money alone.
+                            Fedimint is a way for a group of operators (a federation) to
+                            custody Bitcoin together instead of any single party holding it.
                         </p>
                         <p>
                             Fedimint uses federated consensus across guardians to issue and
