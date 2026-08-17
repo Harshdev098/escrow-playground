@@ -569,7 +569,7 @@ export const SCRIPT_STEPS: Record<StepId, ScriptStep> = {
         eyebrow: "Step 2 — the only live path",
         title: "Right now, only the buyer can move these funds",
         body:
-            "After the successfull delivery of goods/services, the seller has no authority to release the contract locked funds without the buyer signatures. The arbiter's signature won't verify before teh timeout reaches that they could send that the federation would accept — there's no Resolution variant for a unilateral withdrawal. The arbiter's signature won't verify yet either — the module won't check it before the timeout. Choose what happens next.",
+            "After the successfull delivery of goods/services, the seller has no authority to release the contract locked funds without the buyer signatures. The arbiter's signature won't verify before teh timeout reaches.",
         isWait: true,
     },
     "happy-sign-relay": {
