@@ -692,7 +692,7 @@ export interface TrustAssumption {
 export const TRUST_ASSUMPTIONS: TrustAssumption[] = [
     { to: "Buyer honestly signs Release service have been fulfilled, otherwise the seller may need to wait for timeout and arbitration." },
     { to: "Arbiter makes a fair, evidence-based decision when a dispute is raised." },
-    { to: "Seller cooperates in submitting the arbiter's signed decision; otherwise, the escrow and arbiter fee may remain unresolved." },
+    { to: "Winning party of dispute cooperates in submitting the arbiter's signed decision; otherwise, the escrow and arbiter fee may remain unresolved." },
     { to: "Seller fulfils the real-world obligation agreed outside the escrow; the protocol cannot verify delivery or service completion." },
 ];
 

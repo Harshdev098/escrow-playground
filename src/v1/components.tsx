@@ -126,13 +126,13 @@ export function UnderstandTab({ goTo }: { goTo: (id: TabId) => void }) {
         <div className="tab-page">
             <Pill tone="primary">FEDIMINT MODULE · ESCROW</Pill>
             <h1 className="hero-title">
-                Escrow without trusting
+                Trust-minimized escrow
                 <br />
-                the escrow.
+                for Fedimint ecash.
             </h1>
             <p className="hero-sub">
-                Lock ecash under a programmable agreement between buyer, seller, and arbiter. The contract enforces who can
-                release or refund the funds — without needing to know anyone's real-world identity, or what the dispute was
+                Lock ecash under a programmable agreement between buyer, seller, and arbiter. The federation enforces who can
+                release or refund the funds cryptographically, without needing to know anyone's real-world identity, or what the dispute was
                 even about.
             </p>
             <div className="hero-ctas">
@@ -1026,8 +1026,7 @@ export function TrustTab() {
             <Pill tone="primary">TRUST MODEL</Pill>
             <h2 className="page-title">What do you actually have to trust?</h2>
             <p className="page-sub">
-                Trust-minimized doesn't mean trust-free. It means the trust required is explicit, narrow, and enforced where
-                it can be — and named where it can't.
+                Cryptography removes certain kinds of trust. It doesn't remove every kind of trust.
             </p>
 
 
@@ -1043,7 +1042,7 @@ export function TrustTab() {
             </div>
 
             <Card className="not-required">
-                <div className="not-required__title">YOU DO NOT NEED THE MODULE TO KNOW</div>
+                <div className="not-required__title">What the federation doesn't need to know</div>
                 <div className="not-required__grid">
                     {NOT_REQUIRED.map((item) => (
                         <div key={item} className="not-required__item">
