@@ -1,39 +1,54 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { Fragment, useState, useCallback, useEffect, useRef } from "react";
 import type { ReactNode, CSSProperties, MouseEventHandler, Dispatch, SetStateAction } from "react";
 import {
     ContractStatus,
     Outcome,
-    createEscrowState,
-    evaluateAction,
-    applyAction,
-    computeLiveStatus,
-    SCRIPT_STEPS,
-    creationFields,
-    relaySignatureFields,
-    arbiterRelayFields,
-    buildPacket,
+    ERROR_MESSAGES,
+    BREAK_SCENARIOS,
     TRUST_ASSUMPTIONS,
     NOT_REQUIRED,
+    FALLBACK_OPTIONS,
+    createEscrowState,
+    evaluateAction,
+    applyEvaluation,
+    getPhase,
+    isSettled,
+    swapAvailable,
+    scriptStep,
+    packetForAction,
+    packetForStep,
+    nextClaimPacket,
+    breakScenarioAvailable,
 } from "./domain";
 import type {
     EscrowState,
     EscrowAction,
     ContractStatusType,
-    CreateEscrowStateConfig,
-    ActorStatus,
+    ActionEvaluation,
+    OutcomeType,
+    FallbackKind,
     StepId,
     PacketInstance,
     PacketDef,
     PartyId,
+    Phase,
+    Role,
 } from "./domain";
 
-function useNow(intervalMs: number) {
-    const [now, setNow] = useState<number>(Date.now());
+/** Re-renders every `intervalMs` and returns the current time. */
+function useNow(intervalMs: number): number {
+    const [, setTick] = useState(0);
     useEffect(() => {
-        const id = setInterval(() => setNow(Date.now()), intervalMs);
+        const id = setInterval(() => setTick((t) => t + 1), intervalMs);
         return () => clearInterval(id);
     }, [intervalMs]);
-    return now;
+    return Date.now();
+}
+
+function fmtCountdown(ms: number): string {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
 }
 
 type PillTone = "neutral" | "primary" | "success" | "warning" | "danger" | "blue";
@@ -131,7 +146,7 @@ export function UnderstandTab({ goTo }: { goTo: (id: TabId) => void }) {
                 for Fedimint ecash.
             </h1>
             <p className="hero-sub">
-                Lock ecash under a programmable agreement between buyer, seller, and arbiter. The federation enforces who can
+                Lock ecash under a programmable agreement between funder, recipient, and arbiter. The federation enforces who can
                 release or refund the funds cryptographically, without needing to know anyone's real-world identity, or what the dispute was
                 even about.
             </p>
@@ -157,10 +172,7 @@ export function UnderstandTab({ goTo }: { goTo: (id: TabId) => void }) {
                         </p>
                         <p>
                             Fedimint uses federated consensus across guardians to issue and
-                            redeem blind-signed ecash notes. A module is a pluggable unit of consensus logic, and this escrow module
-                            adds a new transaction type (<code>EscrowOutput</code> / <code>EscrowInput</code>) that the federation
-                            validates alongside its normal mint operations, without the federation needing to understand what the
-                            escrow is "about."
+                            redeem blind-signed ecash notes.
                         </p>
                     </div>
                 )}
@@ -169,16 +181,53 @@ export function UnderstandTab({ goTo }: { goTo: (id: TabId) => void }) {
     );
 }
 
+/* ============================================================================
+   STAGE — parties around the federation, with wallet balances, the escrow's
+   locked amount, and a marker for whichever packet is travelling.
+   Solid lines are federation transactions, dashed lines are off-chain hand-offs.
+   ============================================================================ */
+
 const PARTY_META: Record<PartyId, { label: string; sub: string; colorVar: string; pos: { x: number; y: number } }> = {
-    buyer: { label: "Buyer", sub: "buyer_key", colorVar: "var(--color-blue)", pos: { x: 14, y: 22 } },
-    seller: { label: "Seller", sub: "seller_key", colorVar: "var(--color-primary)", pos: { x: 86, y: 22 } },
-    arbiter: { label: "Arbiter", sub: "arbiter_key", colorVar: "var(--color-warning)", pos: { x: 50, y: 90 } },
-    federation: { label: "Federation", sub: "escrow module", colorVar: "var(--color-dark)", pos: { x: 50, y: 50 } },
+    funder: { label: "funder", sub: "funder_key", colorVar: "var(--color-blue)", pos: { x: 14, y: 18 } },
+    recipient: { label: "recipient", sub: "recipient_key", colorVar: "var(--color-primary)", pos: { x: 86, y: 18 } },
+    arbiter: { label: "Arbiter", sub: "arbiter_key", colorVar: "var(--color-warning)", pos: { x: 50, y: 76 } },
+    federation: { label: "Federation", sub: "escrow module", colorVar: "var(--color-dark)", pos: { x: 50, y: 44 } },
 };
 
-function StageNode({ party, highlighted }: { party: PartyId; highlighted: boolean }) {
+/** After a SwapArbiter fallback the arbiter node represents the replacement. */
+function partyLabel(party: PartyId, swapped: boolean): string {
+    return party === "arbiter" && swapped ? "Arbiter #2" : PARTY_META[party].label;
+}
+
+function statusTone(status: ContractStatusType): PillTone {
+    switch (status) {
+        case ContractStatus.RELEASED:
+            return "success";
+        case ContractStatus.REFUNDED:
+            return "blue";
+        case ContractStatus.SPLIT:
+            return "primary";
+        case ContractStatus.DISPUTED:
+            return "warning";
+        default:
+            return "neutral";
+    }
+}
+
+function StageNode({
+    party,
+    swapped = false,
+    highlighted,
+    chips,
+}: {
+    party: PartyId;
+    swapped?: boolean;
+    highlighted: boolean;
+    chips: ReactNode;
+}) {
     const meta = PARTY_META[party];
     const isFederation = party === "federation";
+    const isSwappedArbiter = party === "arbiter" && swapped;
     return (
         <div
             className={`stage-node${highlighted ? " stage-node--highlighted" : ""}${isFederation ? " stage-node--federation" : ""}`}
@@ -192,17 +241,23 @@ function StageNode({ party, highlighted }: { party: PartyId; highlighted: boolea
                     color: highlighted || isFederation ? "#fff" : meta.colorVar,
                 }}
             >
-                {isFederation ? "⛨" : meta.label.slice(0, 1)}
+                {isFederation ? "⛨" : isSwappedArbiter ? "A2" : meta.label.slice(0, 1)}
             </div>
-            <div className="stage-node__label">{meta.label}</div>
-            <div className="stage-node__sub">{meta.sub}</div>
+            <div className="stage-node__label">{partyLabel(party, swapped)}</div>
+            <div className="stage-node__sub">{isSwappedArbiter ? "swap arbiter_key" : meta.sub}</div>
+            <div className="stage-node__chips">{chips}</div>
         </div>
     );
 }
 
-function FlightMarker({ packet }: { packet: PacketInstance; phase: "out" | "back" | null }) {
-    const tone =
-        packet.status === "accepted" ? "var(--color-success)" : packet.status === "rejected" ? "var(--color-danger)" : "var(--color-primary)";
+function FlightMarker({ packet }: { packet: PacketInstance }) {
+    const tone = !packet.submits
+        ? "var(--color-blue)"
+        : packet.status === "accepted"
+            ? "var(--color-success)"
+            : packet.status === "rejected"
+                ? "var(--color-danger)"
+                : "var(--color-primary)";
     return (
         <div className="flight-marker" style={{ background: tone }} title={packet.title}>
             <span className="flight-marker__kind">{packet.kind}</span>
@@ -210,23 +265,30 @@ function FlightMarker({ packet }: { packet: PacketInstance; phase: "out" | "back
     );
 }
 
+function approveLabelFor(packet: PacketInstance): string {
+    if (!packet.submits) return "Share off-chain →";
+    if (packet.action.type === "CREATE_CONTRACT") return "Create Contract →";
+    return "Approve →";
+}
+
+/** The parked packet: full-width detail with a clearly separated approve action. */
 function DockedPacket({
     packet,
+    swapped,
     onInspect,
     onApprove,
-    approveLabel,
 }: {
     packet: PacketInstance;
+    swapped: boolean;
     onInspect: () => void;
     onApprove?: () => void;
-    approveLabel?: string;
 }) {
     return (
         <Card className="docked-packet">
             <div className="docked-packet__route">
-                <span className="docked-packet__party">{PARTY_META[packet.from].label}</span>
+                <span className="docked-packet__party">{partyLabel(packet.from, swapped)}</span>
                 <span className="docked-packet__arrow">{packet.submits ? "→" : "⇢"}</span>
-                <span className="docked-packet__party">{PARTY_META[packet.to].label}</span>
+                <span className="docked-packet__party">{partyLabel(packet.to, swapped)}</span>
                 {!packet.submits && <span className="docked-packet__offchain">off-chain</span>}
             </div>
             <button className="docked-packet__body" onClick={onInspect}>
@@ -236,7 +298,7 @@ function DockedPacket({
             </button>
             {onApprove && (
                 <Button variant="primary" onClick={onApprove}>
-                    {approveLabel || "Approve →"}
+                    {approveLabelFor(packet)}
                 </Button>
             )}
         </Card>
@@ -251,6 +313,7 @@ function PacketInspector({ packet, onClose }: { packet: PacketInstance | null; o
             </Card>
         );
     }
+    const result = packet.result;
     return (
         <Card className="inspector">
             <div className="inspector__head">
@@ -270,16 +333,32 @@ function PacketInspector({ packet, onClose }: { packet: PacketInstance | null; o
                     </div>
                 ))}
             </div>
-            {packet.result && (
-                <div className={`inspector__result ${packet.submits ? (packet.result.valid ? "inspector__result--valid" : "inspector__result--invalid") : "inspector__result--relay"}`}>
+            {result && (
+                <div
+                    className={`inspector__result ${packet.submits ? (result.valid ? "inspector__result--valid" : "inspector__result--invalid") : "inspector__result--relay"
+                        }`}
+                >
                     <div className="inspector__result-status">
-                        {!packet.submits ? "↳ Delivered off-chain" : packet.result.valid ? "✓ Accepted" : "✕ Rejected"}
+                        {!packet.submits ? "↳ Delivered off-chain" : result.valid ? "✓ Accepted" : "✕ Rejected"}
+                        {result.error && <span className="inspector__error">{result.error}</span>}
                     </div>
-                    <div className="inspector__result-reason">{packet.result.reason}</div>
-                    {packet.result.payout && (
+                    {result.error && <div className="inspector__error-message">“{ERROR_MESSAGES[result.error]}”</div>}
+                    <div className="inspector__result-reason">{result.reason}</div>
+                    {result.claims && (
+                        <div className="inspector__claims">
+                            <div className="inspector__claims-title">Claim pool written — still locked in the federation</div>
+                            {result.claims.map((c) => (
+                                <div key={c.party} className="inspector__claims-row">
+                                    <span>{PARTY_META[c.party].label}</span>
+                                    <span>{c.amount} sats</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {result.payout && (
                         <div className="inspector__result-payout">
-                            {packet.result.payout.amount} ecash → {packet.result.payout.to}
-                            {packet.result.payout.note ? ` (${packet.result.payout.note})` : ""}
+                            {result.payout.amount} sats → {result.payout.to}
+                            {result.payout.note ? ` (${result.payout.note})` : ""}
                         </div>
                     )}
                 </div>
@@ -294,58 +373,94 @@ function lerpPos(from: PartyId, to: PartyId, t: number): { x: number; y: number 
     return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
 }
 
+function timerPill(state: EscrowState, now: number, phase: Phase): { tone: PillTone; text: string } | null {
+    switch (phase) {
+        case "active-waiting":
+            return { tone: "neutral", text: `⏱ arbiter can be engaged in ${fmtCountdown(state.timeoutAt - now)}` };
+        case "active-open":
+            return { tone: "warning", text: "⏱ TIMEOUT REACHED — arbiter can be engaged" };
+        case "disputed-open":
+            return {
+                tone: "warning",
+                text: `⏱ ${state.swapped ? "replacement arbiter" : "arbiter"} must decide within ${fmtCountdown((state.resolveBy ?? now) - now)}`,
+            };
+        case "disputed-expired":
+            return {
+                tone: "danger",
+                text: swapAvailable(state) ? "⏱ DEADLINE PASSED — fallback will swap the arbiter" : "⏱ DEADLINE PASSED — fallback is open",
+            };
+        case "claiming":
+            return { tone: "warning", text: "CLAIMS PENDING" };
+        default:
+            return null;
+    }
+}
+
 function Stage({
     state,
     now,
-    timeoutSeconds,
     flightPacket,
     flightPhase,
     parkedPacket,
     onApproveParked,
     onInspect,
-    approveLabel,
-    contractExists = true,
 }: {
     state: EscrowState;
     now: number;
-    timeoutSeconds: number;
     flightPacket: PacketInstance | null;
     flightPhase: "out" | "back" | null;
     parkedPacket: PacketInstance | null;
     onApproveParked?: () => void;
     onInspect: (p: PacketInstance) => void;
-    approveLabel?: string;
-    contractExists?: boolean;
 }) {
-    const remaining = Math.max(0, Math.round((state.timeoutAt - now) / 1000));
-    const timedOut = now >= state.timeoutAt;
-    const statusTone: PillTone =
-        state.status === ContractStatus.RELEASED ? "success" : state.status === ContractStatus.REFUNDED ? "blue" : "neutral";
-
+    const phase = getPhase(state, now);
+    const timer = timerPill(state, now, phase);
     const senderParty = parkedPacket?.from ?? flightPacket?.from;
     const activeDestination = parkedPacket?.to ?? flightPacket?.to;
+    const claimable = (role: Role) => state.claimPool?.find((c) => c.party === role)?.amount ?? 0;
 
     const flyingPos = flightPacket
         ? lerpPos(flightPacket.from, flightPacket.to, flightPhase === "back" ? 0.22 : flightPhase === "out" ? 0.82 : 0)
         : null;
 
+    const walletChips = (role: Role) => (
+        <>
+            <span className="node-chip">{state.wallets[role]} ecash</span>
+            {claimable(role) > 0 && <span className="node-chip node-chip--claim">claim: {claimable(role)}</span>}
+            {role === "arbiter" && state.swapped && <span className="node-chip node-chip--swap">swapped in</span>}
+        </>
+    );
+
+    const edge = (a: PartyId, b: PartyId, cls: string) => (
+        <line
+            key={`${a}-${b}`}
+            x1={PARTY_META[a].pos.x}
+            y1={PARTY_META[a].pos.y}
+            x2={PARTY_META[b].pos.x}
+            y2={PARTY_META[b].pos.y}
+            className={cls}
+        />
+    );
+
     return (
         <Card className="stage">
             {parkedPacket && (
-                <DockedPacket packet={parkedPacket} onInspect={() => onInspect(parkedPacket)} onApprove={onApproveParked} approveLabel={approveLabel} />
+                <DockedPacket
+                    packet={parkedPacket}
+                    swapped={state.swapped}
+                    onInspect={() => onInspect(parkedPacket)}
+                    onApprove={onApproveParked}
+                />
             )}
 
             <div className="stage__header">
-                {contractExists ? (
+                {state.created ? (
                     <>
                         <div className="stage__amount">
-                            {state.status === ContractStatus.ACTIVE ? "🔒" : state.status === ContractStatus.RELEASED ? "→ ✓" : "↩ ✓"} {state.amount} ecash
+                            {state.locked > 0 ? "🔒" : "✓"} {state.locked} ecash in escrow
                         </div>
-                        <Pill tone={statusTone}>{state.status.toUpperCase()}</Pill>
-                        {state.pendingArbiterFee != null && <Pill tone="warning">FEE PENDING: {state.pendingArbiterFee}</Pill>}
-                        {state.status === ContractStatus.ACTIVE && (
-                            <Pill tone={timedOut ? "warning" : "neutral"}>{timedOut ? "⏱ TIMEOUT REACHED" : `⏱ ${remaining}s / ${timeoutSeconds}s`}</Pill>
-                        )}
+                        <Pill tone={statusTone(state.status)}>{state.status.toUpperCase()}</Pill>
+                        {timer && <Pill tone={timer.tone}>{timer.text}</Pill>}
                     </>
                 ) : (
                     <Pill tone="neutral">NO CONTRACT YET</Pill>
@@ -354,31 +469,45 @@ function Stage({
 
             <div className="stage__canvas">
                 <svg className="stage__edges" viewBox="0 0 100 100" preserveAspectRatio="none">
-                    <line x1={PARTY_META.buyer.pos.x} y1={PARTY_META.buyer.pos.y} x2={PARTY_META.federation.pos.x} y2={PARTY_META.federation.pos.y} className="stage__edge" />
-                    <line x1={PARTY_META.seller.pos.x} y1={PARTY_META.seller.pos.y} x2={PARTY_META.federation.pos.x} y2={PARTY_META.federation.pos.y} className="stage__edge" />
-                    <line x1={PARTY_META.arbiter.pos.x} y1={PARTY_META.arbiter.pos.y} x2={PARTY_META.federation.pos.x} y2={PARTY_META.federation.pos.y} className="stage__edge" />
-                    <line x1={PARTY_META.buyer.pos.x} y1={PARTY_META.buyer.pos.y} x2={PARTY_META.seller.pos.x} y2={PARTY_META.seller.pos.y} className="stage__edge stage__edge--relay" />
-                    {activeDestination && senderParty && (
-                        <line
-                            x1={PARTY_META[senderParty].pos.x}
-                            y1={PARTY_META[senderParty].pos.y}
-                            x2={PARTY_META[activeDestination].pos.x}
-                            y2={PARTY_META[activeDestination].pos.y}
-                            className="stage__edge stage__edge--active"
-                        />
-                    )}
+                    {edge("funder", "federation", "stage__edge")}
+                    {edge("recipient", "federation", "stage__edge")}
+                    {edge("arbiter", "federation", "stage__edge")}
+                    {edge("funder", "recipient", "stage__edge stage__edge--offchain")}
+                    {edge("arbiter", "funder", "stage__edge stage__edge--offchain")}
+                    {edge("arbiter", "recipient", "stage__edge stage__edge--offchain")}
+                    {senderParty && activeDestination && edge(senderParty, activeDestination, "stage__edge stage__edge--active")}
                 </svg>
 
-                <StageNode party="buyer" highlighted={senderParty === "buyer" || activeDestination === "buyer"} />
-                <StageNode party="seller" highlighted={senderParty === "seller" || activeDestination === "seller"} />
-                <StageNode party="arbiter" highlighted={senderParty === "arbiter" || activeDestination === "arbiter"} />
-                <StageNode party="federation" highlighted={activeDestination === "federation" && flightPhase === "back"} />
+                <StageNode party="funder" highlighted={senderParty === "funder" || activeDestination === "funder"} chips={walletChips("funder")} />
+                <StageNode party="recipient" highlighted={senderParty === "recipient" || activeDestination === "recipient"} chips={walletChips("recipient")} />
+                <StageNode
+                    party="arbiter"
+                    swapped={state.swapped}
+                    highlighted={senderParty === "arbiter" || activeDestination === "arbiter"}
+                    chips={walletChips("arbiter")}
+                />
+                <StageNode
+                    party="federation"
+                    highlighted={activeDestination === "federation" && flightPhase === "back"}
+                    chips={
+                        <span className="node-chip node-chip--locked">{state.created ? `🔒 ${state.locked} locked` : "no contract"}</span>
+                    }
+                />
 
                 {flightPacket && flyingPos && (
                     <div className="stage__flight-pos" style={{ left: `${flyingPos.x}%`, top: `${flyingPos.y}%` }}>
-                        <FlightMarker packet={flightPacket} phase={flightPhase} />
+                        <FlightMarker packet={flightPacket} />
                     </div>
                 )}
+            </div>
+
+            <div className="stage__legend">
+                <span>
+                    <i className="legend-line" /> federation transaction
+                </span>
+                <span>
+                    <i className="legend-line legend-line--dashed" /> off-chain hand-off
+                </span>
             </div>
         </Card>
     );
@@ -394,7 +523,7 @@ function PacketLog({ packets, onInspect }: { packets: PacketInstance[]; onInspec
                     .slice()
                     .reverse()
                     .map((p) => {
-                        const resultLabel = !p.submits ? "↳ delivered" : p.result?.valid ? "✓ accepted" : "✕ rejected";
+                        const resultLabel = !p.submits ? "↳ delivered" : p.result?.valid ? "✓ accepted" : `✕ rejected · ${p.result?.error ?? ""}`;
                         const resultClass = !p.submits ? "event-log__result--relay" : p.result?.valid ? "event-log__result--valid" : "event-log__result--invalid";
                         return (
                             <button key={p.id} className="event-log__entry event-log__entry--clickable" onClick={() => onInspect(p)}>
@@ -411,72 +540,110 @@ function PacketLog({ packets, onInspect }: { packets: PacketInstance[]; onInspec
     );
 }
 
-function StatusBoard({ statuses }: { statuses: ActorStatus[] }) {
-    return (
-        <Card className="status-board">
-            <SectionLabel>Who can send a packet right now, and why</SectionLabel>
-            <div className="status-board__rows">
-                {statuses.map((s) => (
-                    <div key={s.actor} className={`status-row ${s.live ? "status-row--live" : "status-row--dead"}`}>
-                        <div className="status-row__dot" />
-                        <div className="status-row__body">
-                            <div className="status-row__head">
-                                <span className="status-row__actor">{s.label}</span>
-                                <span className="status-row__action">{s.actionLabel}</span>
-                                <span className={`status-row__badge ${s.live ? "status-row__badge--live" : "status-row__badge--dead"}`}>
-                                    {s.live ? "LIVE" : "NOT AVAILABLE"}
-                                </span>
-                            </div>
-                            <div className="status-row__reason">{s.reason}</div>
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </Card>
-    );
+/* ============================================================================
+   PROGRESS PANEL — "where do things stand, and what is true right now"
+   ============================================================================ */
+
+function phaseNote(phase: Phase, state: EscrowState): string {
+    switch (phase) {
+        case "active-waiting":
+            return "Only the funder's signature can release the funds. The arbiter can't be engaged until the timeout passes.";
+        case "active-open":
+            return "The timeout has passed. The funder can still release the funds — but now either party can also engage the arbiter.";
+        case "disputed-open":
+            return state.swapped
+                ? "The arbiter was swapped. The replacement is now the active arbiter and the original's signature is rejected. They must rule before the new resolve_by, otherwise the fallback refunds with no fee."
+                : "The arbiter has been engaged. The funder's release is now rejected; the arbiter must decide before resolve_by, and submits their signed outcome themselves.";
+        case "disputed-expired":
+            if (swapAvailable(state)) {
+                return "The arbiter missed the deadline, so their signature is no longer accepted. Either party can now trigger the fallback — SwapArbiter, which pays nobody yet: it brings in a replacement arbiter for one more window.";
+            }
+            if (state.swapped) {
+                return "The replacement arbiter missed the deadline too. There is no second swap, so either party can now trigger the fallback, which refunds with no arbiter fee.";
+            }
+            return `The arbiter missed the deadline, so their signature is no longer accepted. Either party can now trigger the default fallback (${state.defaultFallback}).`;
+        case "claiming":
+            return "The contract is settled, but the funds are still locked in the federation. The claim pool names each claimant, and each one collects their own share:";
+        case "done":
+            return state.resolveBy === null
+                ? "Terminal — the funder's release paid the recipient directly, and the escrow_id can never be spent again."
+                : "Terminal — everything has been paid out, and the escrow_id can never be spent again.";
+        default:
+            return "";
+    }
 }
 
-function StateMachineDiagram({ status, pendingFee }: { status: ContractStatusType; pendingFee: number | null }) {
-    const step = status === ContractStatus.ACTIVE ? 0 : 1;
-    const outcomeLabel = status === ContractStatus.RELEASED ? "Released → Seller" : status === ContractStatus.REFUNDED ? "Refunded → Buyer" : null;
-    const outcomeTone = status === ContractStatus.RELEASED ? "success" : "blue";
+type TrackTone = "dark" | "warning" | "success" | "blue" | "primary";
+
+function ProgressPanel({ state, now }: { state: EscrowState; now: number }) {
+    const phase = getPhase(state, now);
+    const resolved = isSettled(state.status);
+    const disputed = state.resolveBy !== null;
+    const paid = resolved && state.locked === 0;
+
+    const resolvedLabel =
+        state.status === ContractStatus.RELEASED ? "Released → recipient" : state.status === ContractStatus.REFUNDED ? "Refunded → funder" : state.status === ContractStatus.SPLIT ? "Split" : "Resolved";
+    const resolvedTone: TrackTone = state.status === ContractStatus.RELEASED ? "success" : state.status === ContractStatus.REFUNDED ? "blue" : "primary";
+
+    const nodes: { key: string; label: string; reached: boolean; skipped?: boolean; tone: TrackTone }[] = [
+        { key: "locked", label: "Locked", reached: true, tone: "dark" },
+        { key: "disputed", label: "Disputed", reached: disputed, skipped: resolved && !disputed, tone: "warning" },
+        ...(state.swapped ? [{ key: "swapped", label: "Arbiter swapped", reached: true, tone: "warning" as TrackTone }] : []),
+        { key: "resolved", label: resolvedLabel, reached: resolved, tone: resolvedTone },
+        { key: "paid", label: "Paid out", reached: paid, tone: "success" },
+    ];
 
     return (
         <Card>
             <SectionLabel>Where things stand</SectionLabel>
             <div className="progress-track">
-                <div className={`progress-step${step >= 0 ? " progress-step--active" : ""}`}>
-                    <div className="progress-step__dot" />
-                    <div className="progress-step__label">Locked</div>
-                </div>
-                <div className={`progress-line${step >= 1 ? " progress-line--active" : ""}`} />
-                <div className={`progress-step${step >= 1 ? ` progress-step--active progress-step--${outcomeTone}` : ""}`}>
-                    <div className="progress-step__dot" />
-                    <div className="progress-step__label">{outcomeLabel ?? "Resolved"}</div>
-                </div>
+                {nodes.map((n, i) => (
+                    <Fragment key={n.key}>
+                        {i > 0 && <div className={`progress-line${n.reached || n.skipped ? " progress-line--active" : ""}`} />}
+                        <div
+                            className={`progress-step${n.reached ? ` progress-step--reached progress-step--${n.tone}` : ""}${n.skipped ? " progress-step--skipped" : ""}`}
+                        >
+                            <div className="progress-step__dot" />
+                            <div className="progress-step__label">{n.label}</div>
+                        </div>
+                    </Fragment>
+                ))}
             </div>
-            {status !== ContractStatus.ACTIVE && (
-                <div className="progress-note">Terminal — escrow_id is consumed, this contract can never be spent again</div>
-            )}
-            {pendingFee != null && (
-                <div className="progress-fee-note">
-                    <Pill tone="warning">Arbiter fee pending: {pendingFee}</Pill>
-                    <span>tracked separately from the contract's own status</span>
+            <div className="progress-note">{phaseNote(phase, state)}</div>
+            {state.claimPool && state.claimPool.length > 0 && (
+                <div className="progress-pool">
+                    {state.claimPool.map((c) => (
+                        <div key={c.party} className="progress-pool__row">
+                            <span>{PARTY_META[c.party].label}</span>
+                            <span>{c.amount} sats · unclaimed</span>
+                        </div>
+                    ))}
                 </div>
             )}
         </Card>
     );
 }
 
+/* ============================================================================
+   PACKET ENGINE — parks a packet, and on approval animates it out, evaluates it
+   with the domain rules, animates the result back, then commits the state change.
+   Refs guard against double-approval; nothing with side effects runs inside a
+   state updater.
+   ============================================================================ */
+
 type FlightPhase = "out" | "back" | null;
 
 function usePacketEngine(state: EscrowState, setState: Dispatch<SetStateAction<EscrowState>>) {
-    const [parked, setParked] = useState<PacketInstance | null>(null);
+    const [parked, setParkedState] = useState<PacketInstance | null>(null);
     const [flying, setFlying] = useState<PacketInstance | null>(null);
     const [flightPhase, setFlightPhase] = useState<FlightPhase>(null);
     const [log, setLog] = useState<PacketInstance[]>([]);
     const [inspecting, setInspecting] = useState<PacketInstance | null>(null);
-    const [flash, setFlash] = useState<PartyId | null>(null);
+
+    const parkedRef = useRef<PacketInstance | null>(null);
+    const busyRef = useRef(false);
+    const stateRef = useRef(state);
+    stateRef.current = state;
     const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
     useEffect(
@@ -486,217 +653,224 @@ function usePacketEngine(state: EscrowState, setState: Dispatch<SetStateAction<E
         [],
     );
 
+    const later = (fn: () => void, ms: number) => {
+        timers.current.push(setTimeout(fn, ms));
+    };
+
     const park = useCallback((def: PacketDef) => {
-        setParked({ ...def, status: "parked" });
+        const packet: PacketInstance = { ...def, status: "parked" };
+        parkedRef.current = packet;
+        setParkedState(packet);
     }, []);
 
-    const clearParked = useCallback(() => setParked(null), []);
-
-    const pushLog = useCallback((settled: PacketInstance) => {
-        setLog((l) => (l.some((p) => p.id === settled.id) ? l : [...l, settled]));
+    const clearParked = useCallback(() => {
+        parkedRef.current = null;
+        setParkedState(null);
     }, []);
 
     const approve = useCallback(
         (onSettled?: (accepted: boolean) => void) => {
-            setParked((current) => {
-                if (!current) return current;
-                const packet = current;
-                setFlying({ ...packet, status: "in-flight" });
-                setFlightPhase(null);
-                setFlash(packet.from);
+            const packet = parkedRef.current;
+            if (!packet || busyRef.current) return;
+            busyRef.current = true;
+            parkedRef.current = null;
+            setParkedState(null);
 
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => setFlightPhase("out"));
-                });
+            // Mount the marker at the sender first, then move it on a later frame so the
+            // CSS transition has a real starting position to animate from.
+            setFlying({ ...packet, status: "in-flight" });
+            setFlightPhase(null);
+            requestAnimationFrame(() => requestAnimationFrame(() => setFlightPhase("out")));
 
-                const t1 = setTimeout(() => {
-                    setFlash(null);
-                    if (!packet.submits) {
-                        setFlightPhase("back");
-                        const t2 = setTimeout(() => {
-                            const settled: PacketInstance = {
-                                ...packet,
-                                status: "accepted",
-                                result: { valid: true, reason: `Delivered to ${packet.to}, off-chain — the federation was never involved in this step.` },
-                            };
-                            setFlying(null);
-                            setFlightPhase(null);
-                            pushLog(settled);
-                            setInspecting(settled);
-                            onSettled?.(true);
-                        }, 650);
-                        timers.current.push(t2);
-                        return;
-                    }
+            later(() => {
+                const evaluation: ActionEvaluation | null = packet.submits ? evaluateAction(stateRef.current, packet.action, Date.now()) : null;
+                const accepted = evaluation ? evaluation.valid : true;
+                const result: PacketInstance["result"] = evaluation
+                    ? { valid: evaluation.valid, reason: evaluation.reason, error: evaluation.error, payout: evaluation.payout, claims: evaluation.claims }
+                    : { valid: true, reason: `Delivered to the ${packet.to}, off-chain — the federation was never involved in this step.` };
 
-                    if (packet.action.label === "__CREATE__") {
-                        const opId = "op_" + Math.random().toString(16).slice(2, 10);
-                        const result = {
-                            valid: true,
-                            reason: `The module independently recomputes contract_hash and checks it against what was submitted, rejects a zero amount, an arbiter_fee >= amount, a timeout already in the past, and any two duplicate keys. All checks pass, so the contract is stored and the federation returns operation_id=${opId} confirming it.`,
-                        };
-                        setState((prev) => ({ ...prev, timeoutAt: Date.now() + prev.timeoutSeconds * 1000 }));
-                        setFlightPhase("back");
-                        const t2 = setTimeout(() => {
-                            const settled: PacketInstance = { ...packet, status: "accepted", result };
-                            setFlying(null);
-                            setFlightPhase(null);
-                            pushLog(settled);
-                            setInspecting(settled);
-                            onSettled?.(true);
-                        }, 650);
-                        timers.current.push(t2);
-                        return;
-                    }
+                setFlying({ ...packet, status: accepted ? "accepted" : "rejected" });
+                setFlightPhase("back");
 
-                    const evalResult = evaluateAction(state, packet.action);
-                    const { next, entry } = applyAction(state, packet.action, evalResult, Date.now());
-                    setFlightPhase("back");
-                    const t2 = setTimeout(() => {
-                        const settled: PacketInstance = {
-                            ...packet,
-                            status: evalResult.valid ? "accepted" : "rejected",
-                            result: { valid: evalResult.valid, reason: evalResult.reason, payout: evalResult.payout },
-                        };
-                        setState({ ...next, events: [...next.events, entry] });
-                        setFlying(null);
-                        setFlightPhase(null);
-                        pushLog(settled);
-                        setInspecting(settled);
-                        onSettled?.(evalResult.valid);
-                    }, 650);
-                    timers.current.push(t2);
+                later(() => {
+                    const settled: PacketInstance = { ...packet, status: accepted ? "accepted" : "rejected", result };
+                    if (evaluation) setState((prev) => applyEvaluation(prev, evaluation));
+                    setFlying(null);
+                    setFlightPhase(null);
+                    setLog((l) => [...l, settled]);
+                    setInspecting(settled);
+                    busyRef.current = false;
+                    onSettled?.(accepted);
                 }, 650);
-                timers.current.push(t1);
-
-                return null;
-            });
+            }, 650);
         },
-        [state, setState, pushLog],
+        [setState],
     );
 
-    const reset = useCallback(() => {
-        setParked(null);
-        setFlying(null);
-        setFlightPhase(null);
-        setLog([]);
-        setInspecting(null);
-        setFlash(null);
-        timers.current.forEach(clearTimeout);
-        timers.current = [];
-    }, []);
-
-    return { parked, flying, flightPhase, log, inspecting, setInspecting, flash, park, clearParked, approve, reset };
+    return { parked, flying, flightPhase, log, inspecting, setInspecting, park, clearParked, approve };
 }
+
+/* ============================================================================
+   TRY TO BREAK IT — each button is a real packet, enabled only in the phase
+   where the federation should reject it for that specific reason.
+   ============================================================================ */
+
+function TryToBreakItCard({
+    state,
+    now,
+    busy,
+    send,
+}: {
+    state: EscrowState;
+    now: number;
+    busy: boolean;
+    send: (action: EscrowAction) => void;
+}) {
+    return (
+        <Card className="try-break-card">
+            <SectionLabel>Try to break it</SectionLabel>
+            <p className="try-break-card__note">
+                Each button sends a real packet at a moment when the federation should reject it. Greyed-out buttons unlock in the phase where they apply — the line under each one says when.
+            </p>
+            <div className="break-grid">
+                {BREAK_SCENARIOS.map((s) => (
+                    <button
+                        key={s.id}
+                        className="break-btn"
+                        disabled={busy || !breakScenarioAvailable(s, state, now)}
+                        onClick={() => send(s.action)}
+                    >
+                        <span className="break-btn__label">{s.label}</span>
+                        <span className="break-btn__hint">{s.hint}</span>
+                    </button>
+                ))}
+            </div>
+        </Card>
+    );
+}
+
+/* ============================================================================
+   GUIDED WALKTHROUGH
+   create → fork ─┬─ happy:   sign (off-chain) → recipient submits → done
+                  └─ dispute: timeout → engage → arbiter decides
+                                 ├─ ruling:  arbiter submits signed outcome → claims → done
+                                 └─ silence: deadline → fallback
+                                       ├─ Refund / Split: claims → done
+                                       └─ SwapArbiter: replacement arbiter decides
+                                             (silence again → fallback refunds → claims → done)
+   ============================================================================ */
 
 function GuidedWalkthrough({
     state,
     setState,
-    timeoutSeconds,
+    onRestart,
 }: {
     state: EscrowState;
     setState: Dispatch<SetStateAction<EscrowState>>;
-    timeoutSeconds: number;
+    onRestart: () => void;
 }) {
     const [stepId, setStepId] = useState<StepId>("create");
-    const [created, setCreated] = useState(false);
-    const [disputeOutcome, setDisputeOutcome] = useState<typeof Outcome.RELEASE | typeof Outcome.REFUND | null>(null);
+    const [disputeOutcome, setDisputeOutcome] = useState<OutcomeType | null>(null);
+    const [retry, setRetry] = useState(0);
     const engine = usePacketEngine(state, setState);
     const now = useNow(1000);
+    const { park, clearParked } = engine;
 
-    const step = SCRIPT_STEPS[stepId];
+    const step = scriptStep(stepId, state);
+    const busy = engine.parked != null || engine.flying != null;
+    const timeoutPassed = now >= state.timeoutAt;
+    const deadlinePassed = state.resolveBy !== null && now > state.resolveBy;
 
+    // Park the packet that belongs to the current step (if it has one).
     useEffect(() => {
-        if (stepId === "dispute-sign-relay" || stepId === "dispute-winner-submits") return;
-        if (step.packet) {
-            const def = buildPacket(`pk_${stepId}`, step.packet.from, step.packet.action, step.packet.kind, step.packet.packetTitle, state, {
-                to: step.packet.to,
-                submits: step.packet.submits,
-            });
-            if (stepId === "create") {
-                // Nothing exists in consensus yet — creation fields are drafted client-side.
-                engine.park({ ...def, fields: creationFields({ amount: state.amount, arbiterFee: state.arbiterFee, timeoutSeconds }) });
-            } else if (stepId === "happy-sign-relay") {
-                // Off-chain hand-off — the raw signature, not yet wrapped in an EscrowInput.
-                engine.park({ ...def, fields: relaySignatureFields(state) });
-            } else {
-                engine.park(def);
-            }
-        } else {
-            engine.clearParked();
+        const def = packetForStep(stepId, state, { outcome: disputeOutcome });
+        if (def) park(def);
+        else clearParked();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [stepId, retry]);
+
+    // Claims: park the next unclaimed entry of the pool, one at a time, until it is empty.
+    useEffect(() => {
+        if (stepId !== "claims" || engine.flying) return;
+        if (!state.claimPool || state.claimPool.length === 0) {
+            setStepId("done");
+            return;
+        }
+        if (!engine.parked) {
+            const def = nextClaimPacket(state);
+            if (def) park(def);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [stepId]);
+    }, [stepId, state.claimPool, engine.flying, engine.parked]);
 
-    const goNext = (target: StepId) => setStepId(target);
-
-    const handleApproveMain = () => {
-        engine.approve(() => {
-            if (stepId === "create") {
-                setCreated(true);
-                goNext("fork");
-            } else if (stepId === "happy-sign-relay") goNext("happy-seller-submits");
-            else if (stepId === "happy-seller-submits") goNext("done");
-            else if (stepId === "dispute-winner-submits") goNext("fee-claim");
-            else if (stepId === "fee-claim") goNext("done");
+    const handleApprove = () => {
+        const parked = engine.parked;
+        if (!parked) return;
+        if (parked.id.startsWith("pk_break_")) {
+            engine.approve();
+            return;
+        }
+        engine.approve((accepted) => {
+            if (!accepted && stepId !== "dispute-submit") {
+                setRetry((n) => n + 1); // put the same packet back
+                return;
+            }
+            switch (stepId) {
+                case "create":
+                    setStepId("fork");
+                    break;
+                case "happy-sign-relay":
+                    setStepId("happy-recipient-submits");
+                    break;
+                case "happy-recipient-submits":
+                    setStepId("done");
+                    break;
+                case "engage":
+                    setStepId("dispute-decide");
+                    break;
+                case "dispute-submit":
+                    // If the window closed while the user was reading, the late outcome is rejected
+                    // and the fallback is the only way forward.
+                    setStepId(accepted ? "claims" : "fallback");
+                    break;
+                case "fallback": {
+                    // `state` here is the state this packet was approved against: if a swap was still
+                    // available, the fallback swapped the arbiter instead of settling.
+                    if (swapAvailable(state)) {
+                        setDisputeOutcome(null);
+                        setStepId("dispute-decide");
+                    } else {
+                        setStepId("claims");
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
         });
     };
 
-    const handleTimeoutAdvance = () => {
-        setState((prev) => ({ ...prev, timeoutAt: Date.now() - 500 }));
-        goNext("dispute-sign-relay");
-    };
+    const fastForwardTimeout = () => setState((prev) => ({ ...prev, timeoutAt: Date.now() - 500 }));
+    const fastForwardDeadline = () => setState((prev) => ({ ...prev, resolveBy: Date.now() - 500 }));
 
-    // Arbiter signs off-chain and the signature is relayed to the winner — no federation
-    // submission happens here, mirroring the buyer->seller relay on the happy path.
-    const handleDisputeChoice = (outcome: typeof Outcome.RELEASE | typeof Outcome.REFUND) => {
-        const winningParty: PartyId = outcome === Outcome.RELEASE ? "seller" : "buyer";
+    // The arbiter signs the outcome and submits it to the federation themselves.
+    const chooseRuling = (outcome: OutcomeType) => {
         setDisputeOutcome(outcome);
-        const action: EscrowAction = {
-            type: "ARBITER_DECISION",
-            outcome,
-            actor: "arbiter",
-            label: `Arbiter decides: ${outcome === Outcome.RELEASE ? "seller wins" : "buyer wins"}`,
-            authRequired: "Arbiter signature (post-timeout)",
-        };
-        const def = buildPacket("pk_dispute-sign-relay", "arbiter", action, "arbiter_signature", `Signed outcome, shared off-chain`, state, {
-            to: winningParty,
-            submits: false,
-        });
-        engine.park({ ...def, fields: arbiterRelayFields(state, outcome, winningParty) });
+        setStepId("dispute-submit");
     };
 
-    const handleApproveDisputeRelay = () => {
-        engine.approve(() => goNext("dispute-winner-submits"));
+    const chooseFallback = (kind: FallbackKind) => {
+        if (state.created) return;
+        setState((prev) => ({ ...prev, defaultFallback: kind }));
+        setRetry((n) => n + 1); // re-park the creation packet with the new default_fallback
     };
 
-    // Once relayed, the winner is the one who submits the ArbiterOutcome resolution.
-    useEffect(() => {
-        if (stepId !== "dispute-winner-submits" || !disputeOutcome) return;
-        const winningParty: PartyId = disputeOutcome === Outcome.RELEASE ? "seller" : "buyer";
-        const action: EscrowAction = {
-            type: "ARBITER_DECISION",
-            outcome: disputeOutcome,
-            actor: "arbiter",
-            label: `Arbiter decides: ${disputeOutcome === Outcome.RELEASE ? "seller wins" : "buyer wins"}`,
-            authRequired: "Arbiter signature (post-timeout)",
-        };
-        const def = buildPacket("pk_dispute-winner-submits", winningParty, action, "EscrowInput", `ArbiterOutcome → ${disputeOutcome}`, state);
-        engine.park(def);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [stepId, disputeOutcome]);
-
-    const isBranchPoint = stepId === "fork";
-    const isDisputeChoicePending = stepId === "dispute-sign-relay" && !engine.parked;
-
-    const breakItBusy = engine.parked != null || engine.flying != null;
-    const terminal = state.status !== ContractStatus.ACTIVE;
-    const hasPendingFee = state.pendingArbiterFee != null;
-    const sendBreakIt = (action: EscrowAction, from: PartyId, kind: string, title: string) => {
-        if (breakItBusy) return;
-        const def = buildPacket(`pk_break_${Date.now()}`, from, action, kind, title, state);
-        engine.park(def);
+    const sendBreakIt = (action: EscrowAction) => {
+        if (busy) return;
+        park(packetForAction(`pk_break_${Date.now()}`, action, state));
     };
+
+    const arbiterName = state.swapped ? "Replacement arbiter" : "Arbiter";
 
     return (
         <div className="walkthrough">
@@ -707,24 +881,74 @@ function GuidedWalkthrough({
                     <div className="walkthrough-beat__body">{step.body}</div>
                 </div>
                 <div className="walkthrough__strip-actions">
-                    {isBranchPoint && (
-                        <>
-                            <Button variant="primary" onClick={() => goNext("happy-sign-relay")}>
-                                Buyer signs now
+                    {stepId === "create" &&
+                        !state.created &&
+                        FALLBACK_OPTIONS.map((o) => (
+                            <Button
+                                key={o.kind}
+                                variant={state.defaultFallback === o.kind ? "dark" : "default"}
+                                disabled={engine.flying != null}
+                                onClick={() => chooseFallback(o.kind)}
+                            >
+                                {o.label}
                             </Button>
-                            <Button onClick={handleTimeoutAdvance}>Buyer stays silent →</Button>
+                        ))}
+
+                    {stepId === "fork" && (
+                        <>
+                            <Button variant="primary" disabled={busy} onClick={() => setStepId("happy-sign-relay")}>
+                                funder signs the release
+                            </Button>
+                            <Button disabled={busy} onClick={() => setStepId("wait-timeout")}>
+                                funder stays silent →
+                            </Button>
                         </>
                     )}
 
-                    {isDisputeChoicePending && (
-                        <>
-                            <Button variant="primary" onClick={() => handleDisputeChoice(Outcome.RELEASE)}>
-                                Rule for seller
+                    {stepId === "wait-timeout" &&
+                        (timeoutPassed ? (
+                            <Button variant="primary" disabled={busy} onClick={() => setStepId("engage")}>
+                                Continue →
                             </Button>
-                            <Button onClick={() => handleDisputeChoice(Outcome.REFUND)}>Rule for buyer</Button>
+                        ) : (
+                            <Button variant="primary" disabled={busy} onClick={fastForwardTimeout}>
+                                ⏩ Fast-forward past the timeout
+                            </Button>
+                        ))}
+
+                    {stepId === "dispute-decide" && disputeOutcome === null && (
+                        <>
+                            <Button variant="primary" disabled={busy} onClick={() => chooseRuling(Outcome.RELEASE)}>
+                                Rule for the recipient
+                            </Button>
+                            <Button disabled={busy} onClick={() => chooseRuling(Outcome.REFUND)}>
+                                Rule for the funder
+                            </Button>
+                            <Button disabled={busy} onClick={() => chooseRuling(Outcome.SPLIT)}>
+                                Split 50 / 50
+                            </Button>
+                            <Button disabled={busy} onClick={() => setStepId("wait-resolution")}>
+                                {arbiterName} stays silent →
+                            </Button>
                         </>
                     )}
 
+                    {stepId === "wait-resolution" &&
+                        (deadlinePassed ? (
+                            <Button variant="primary" disabled={busy} onClick={() => setStepId("fallback")}>
+                                Continue →
+                            </Button>
+                        ) : (
+                            <Button variant="primary" disabled={busy} onClick={fastForwardDeadline}>
+                                ⏩ Fast-forward past the resolution deadline
+                            </Button>
+                        ))}
+
+                    {stepId === "done" && (
+                        <Button variant="primary" onClick={onRestart}>
+                            ↺ Start over
+                        </Button>
+                    )}
                 </div>
             </div>
 
@@ -733,25 +957,14 @@ function GuidedWalkthrough({
                     <Stage
                         state={state}
                         now={now}
-                        timeoutSeconds={timeoutSeconds}
                         flightPacket={engine.flying}
                         flightPhase={engine.flightPhase}
                         parkedPacket={engine.parked}
-                        contractExists={created}
-                        onApproveParked={
-                            engine.parked
-                                ? engine.parked.id.startsWith("pk_break_")
-                                    ? () => engine.approve()
-                                    : stepId === "dispute-sign-relay"
-                                        ? handleApproveDisputeRelay
-                                        : handleApproveMain
-                                : undefined
-                        }
-                        approveLabel={stepId === "create" ? "Create Contract →" : "Approve →"}
+                        onApproveParked={engine.parked ? handleApprove : undefined}
                         onInspect={engine.setInspecting}
                     />
-                    {created && <StateMachineDiagram status={state.status} pendingFee={state.pendingArbiterFee} />}
-                    <TryToBreakItCard send={sendBreakIt} terminal={terminal} hasPendingFee={hasPendingFee} busy={breakItBusy} />
+                    {state.created && <ProgressPanel state={state} now={now} />}
+                    <TryToBreakItCard state={state} now={now} busy={busy} send={sendBreakIt} />
                 </div>
 
                 <div className="playground-col">
@@ -760,275 +973,45 @@ function GuidedWalkthrough({
                 </div>
             </div>
         </div>
-    );
-}
-
-function TryToBreakItCard({
-    send,
-    terminal,
-    hasPendingFee,
-    busy,
-}: {
-    send: (action: EscrowAction, from: PartyId, kind: string, title: string) => void;
-    terminal: boolean;
-    hasPendingFee: boolean;
-    busy: boolean;
-}) {
-    return (
-        <Card className="try-break-card">
-            <SectionLabel>Try to break it</SectionLabel>
-            <p className="try-break-card__note">
-                Every button here sends a packet the federation is expected to reject. Approve one in the stage above and read why in the inspector.
-            </p>
-            <div className="actions-row">
-                <Button
-                    small
-                    variant="danger"
-                    disabled={terminal || busy}
-                    onClick={() =>
-                        send(
-                            { type: "SELLER_WITHDRAW_UNAUTHORIZED", actor: "seller", label: "Seller attempts unauthorized withdrawal", authRequired: "Seller signature (insufficient)" },
-                            "seller",
-                            "EscrowInput",
-                            "Unauthorized withdrawal",
-                        )
-                    }
-                >
-                    Seller: withdraw directly
-                </Button>
-                <Button
-                    small
-                    variant="danger"
-                    disabled={terminal || busy}
-                    onClick={() =>
-                        send(
-                            { type: "ARBITER_DECISION_BAD_SIG", actor: "arbiter", label: "Submit outcome with wrong signature", authRequired: "Arbiter signature (invalid)" },
-                            "arbiter",
-                            "EscrowInput",
-                            "ArbiterOutcome (bad signature)",
-                        )
-                    }
-                >
-                    Arbiter: wrong signature
-                </Button>
-                <Button
-                    small
-                    variant="danger"
-                    disabled={!hasPendingFee || busy}
-                    onClick={() =>
-                        send(
-                            { type: "ARBITER_FEE_CLAIM_BAD_SIG", actor: "arbiter", label: "Arbiter claims fee with an invalid signature", authRequired: "Arbiter signature (invalid)" },
-                            "arbiter",
-                            "EscrowInput",
-                            "ArbiterFeeClaim (bad signature)",
-                        )
-                    }
-                >
-                    Fee claim: wrong signature
-                </Button>
-                <Button
-                    small
-                    variant="danger"
-                    disabled={hasPendingFee || busy}
-                    onClick={() =>
-                        send(
-                            { type: "ARBITER_FEE_CLAIM_TOO_EARLY", actor: "arbiter", label: "Arbiter attempts a fee claim with no pending fee", authRequired: "Arbiter signature (no pending fee exists)" },
-                            "arbiter",
-                            "EscrowInput",
-                            "ArbiterFeeClaim (nothing pending)",
-                        )
-                    }
-                >
-                    Fee claim: nothing pending
-                </Button>
-            </div>
-        </Card>
-    );
-}
-
-function SandboxMode({
-    state,
-    setState,
-    timeoutSeconds,
-    onRestartWalkthrough,
-}: {
-    state: EscrowState;
-    setState: Dispatch<SetStateAction<EscrowState>>;
-    timeoutSeconds: number;
-    onRestartWalkthrough: () => void;
-}) {
-    const engine = usePacketEngine(state, setState);
-    const now = useNow(1000);
-    const timedOut = now >= state.timeoutAt;
-    const terminal = state.status !== ContractStatus.ACTIVE;
-    const hasPendingFee = state.pendingArbiterFee != null;
-    const statuses = useMemo(() => computeLiveStatus(state, now), [state, now]);
-    const busy = engine.parked != null || engine.flying != null;
-
-    const send = (action: EscrowAction, from: PartyId, kind: string, title: string) => {
-        if (busy) return;
-        const def = buildPacket(`pk_${Date.now()}`, from, action, kind, title, state);
-        engine.park(def);
-    };
-
-    return (
-        <>
-            <div className="playground-header">
-                <div>
-                    <h2>Sandbox</h2>
-                    <p>Every button below parks a real packet. Approve it in the stage to send it to the federation and see the result.</p>
-                </div>
-                <Button small onClick={onRestartWalkthrough}>
-                    ↺ Replay walkthrough
-                </Button>
-            </div>
-
-            <div className="playground-grid">
-                <div className="playground-col">
-                    <Stage
-                        state={state}
-                        now={now}
-                        timeoutSeconds={timeoutSeconds}
-                        flightPacket={engine.flying}
-                        flightPhase={engine.flightPhase}
-                        parkedPacket={engine.parked}
-                        onApproveParked={engine.parked ? () => engine.approve() : undefined}
-                        onInspect={engine.setInspecting}
-                    />
-                    <StateMachineDiagram status={state.status} pendingFee={state.pendingArbiterFee} />
-
-                    <Card>
-                        <SectionLabel>Normal actions</SectionLabel>
-                        <div className="actions-row">
-                            <Button
-                                small
-                                disabled={terminal || busy}
-                                onClick={() =>
-                                    send(
-                                        { type: "BUYER_RELEASE", actor: "buyer", label: "Buyer signs release to Seller", authRequired: "Buyer signature" },
-                                        "buyer",
-                                        "EscrowInput",
-                                        "BuyerRelease → Seller",
-                                    )
-                                }
-                            >
-                                Buyer: sign release
-                            </Button>
-                            <Button
-                                small
-                                disabled={terminal || !timedOut || busy}
-                                onClick={() =>
-                                    send(
-                                        { type: "ARBITER_DECISION", outcome: Outcome.RELEASE, actor: "arbiter", label: "Arbiter decides: seller wins", authRequired: "Arbiter signature (post-timeout)" },
-                                        "arbiter",
-                                        "EscrowInput",
-                                        "ArbiterOutcome → Release",
-                                    )
-                                }
-                            >
-                                Arbiter: seller wins
-                            </Button>
-                            <Button
-                                small
-                                disabled={terminal || !timedOut || busy}
-                                onClick={() =>
-                                    send(
-                                        { type: "ARBITER_DECISION", outcome: Outcome.REFUND, actor: "arbiter", label: "Arbiter decides: buyer wins", authRequired: "Arbiter signature (post-timeout)" },
-                                        "arbiter",
-                                        "EscrowInput",
-                                        "ArbiterOutcome → Refund",
-                                    )
-                                }
-                            >
-                                Arbiter: buyer wins
-                            </Button>
-                            <Button small disabled={terminal || timedOut || busy} onClick={() => setState((prev) => ({ ...prev, timeoutAt: Date.now() - 500 }))}>
-                                Force timeout now
-                            </Button>
-                            <Button
-                                small
-                                disabled={!hasPendingFee || busy}
-                                onClick={() =>
-                                    send(
-                                        { type: "ARBITER_FEE_CLAIM", actor: "arbiter", label: "Arbiter claims their fee", authRequired: "Arbiter signature (fresh, over ArbiterFeeClaim message)" },
-                                        "arbiter",
-                                        "EscrowInput",
-                                        "ArbiterFeeClaim",
-                                    )
-                                }
-                            >
-                                Arbiter: claim fee
-                            </Button>
-                        </div>
-                    </Card>
-
-                    <TryToBreakItCard send={send} terminal={terminal} hasPendingFee={hasPendingFee} busy={busy} />
-                </div>
-
-                <div className="playground-col">
-                    <StatusBoard statuses={statuses} />
-                    <PacketInspector packet={engine.inspecting} onClose={() => engine.setInspecting(null)} />
-                    <PacketLog packets={engine.log} onInspect={engine.setInspecting} />
-                </div>
-
-            </div>
-        </>
     );
 }
 
 /* ============================================================================
-   PLAYGROUND TAB — root. Nothing is created until the user approves the
-   first (creation) packet in the guided walkthrough.
+   PLAYGROUND TAB — nothing exists until the funder's creation packet is approved.
    ============================================================================ */
 
 export function PlaygroundTab() {
-    const [amount] = useState<number>(100);
-    const [timeoutSeconds] = useState<number>(30);
-    const [state, setState] = useState<EscrowState>(() => createEscrowState({ amount: 100, timeoutSeconds: 30 }));
-    const [mode, setMode] = useState<"walkthrough" | "sandbox">("walkthrough");
+    const [state, setState] = useState<EscrowState>(() => createEscrowState());
     const [walkthroughKey, setWalkthroughKey] = useState(0);
 
-    const reset = useCallback(
-        (cfg: CreateEscrowStateConfig = {}) => {
-            setState(createEscrowState({ amount, timeoutSeconds, ...cfg }));
-        },
-        [amount, timeoutSeconds],
-    );
-
-    const restartWalkthrough = () => {
-        reset();
+    const restart = () => {
+        setState(createEscrowState());
         setWalkthroughKey((k) => k + 1);
-        setMode("walkthrough");
     };
 
     return (
         <div className="tab-page tab-page--full">
-            {mode === "walkthrough" && (
-                <div className="playground-header">
-                    <div>
-                        <h2>Playground</h2>
-                    </div>
-                </div>
-            )}
-
-            {mode === "walkthrough" ? (
-                <GuidedWalkthrough key={walkthroughKey} state={state} setState={setState} timeoutSeconds={timeoutSeconds} />
-            ) : (
-                <SandboxMode state={state} setState={setState} timeoutSeconds={timeoutSeconds} onRestartWalkthrough={restartWalkthrough} />
-            )}
+            <div className="playground-header">
+                <h2>Playground</h2>
+                <Button small onClick={restart}>
+                    ↺ Restart
+                </Button>
+            </div>
+            <GuidedWalkthrough key={walkthroughKey} state={state} setState={setState} onRestart={restart} />
         </div>
     );
 }
+
+/* ============================================================================
+   TRUST MODEL
+   ============================================================================ */
 
 export function TrustTab() {
     return (
         <div className="tab-page tab-page--medium">
             <Pill tone="primary">TRUST MODEL</Pill>
             <h2 className="page-title">What do you actually have to trust?</h2>
-            <p className="page-sub">
-                Cryptography removes certain kinds of trust. It doesn't remove every kind of trust.
-            </p>
-
+            <p className="page-sub">Cryptography removes certain kinds of trust. It doesn't remove every kind of trust.</p>
 
             <div className="assumptions-section">
                 <SectionLabel>Trust assumptions</SectionLabel>
@@ -1074,31 +1057,34 @@ function TechnicalArchitecture() {
                             <ul className="tech-arch__list">
                                 <li>Human / business dispute</li>
                                 <li>Arbiter's reasoning process</li>
-                                <li>Buyer ↔ seller communication</li>
                                 <li>Evidence review</li>
+                                <li>The funder's release signature handed to the recipient</li>
                             </ul>
                         </div>
                         <div>
                             <div className="tech-arch__label tech-arch__label--enforced">ENFORCED BY THE MODULE</div>
                             <ul className="tech-arch__list">
-                                <li>Contract validity (escrow_id uniqueness, contract_hash match)</li>
-                                <li>Signature verification (buyer / arbiter, including the separate fee-claim signature)</li>
-                                <li>Timeout gating of arbiter authority</li>
-                                <li>State transitions (Active → Released/Refunded)</li>
-                                <li>Fund release per contract rules, arbiter fee held pending until claimed</li>
+                                <li>Contract validity (field checks, contract_hash match, escrow_id uniqueness)</li>
+                                <li>Signature verification (funder release, engage request, arbiter outcome against the active arbiter key)</li>
+                                <li>Arbiter engagement only after the timeout</li>
+                                <li>Resolution deadline, then the default fallback (Refund, Split, or a one-time SwapArbiter)</li>
+                                <li>SwapArbiter: the first fallback swaps the arbiter, key and fee and opens a new window; the second pays a Refund with no fee</li>
+                                <li>State transitions: Active → Disputed → Released / Refunded / Split, exactly once</li>
+                                <li>Claim pool: written by an outcome or fallback, includes the arbiter fee, every share claimable once, only by the key named in the pool</li>
                             </ul>
                         </div>
                     </div>
                     <div className="tech-arch__hash-block">
+                        contract_hash = hash(funder_key, recipient_key, arbiter_key, arbiter_fee, amount, timeout, federation_id, resolution_period, default_fallback, arbiter_fee_key)
+                        <br />
                         resolution message = hash(federation_id, escrow_id, outcome, contract_hash)
                         <br />
-                        contract_hash = hash(buyer_key, seller_key, arbiter_key, amount, timeout, federation_id)
+                        engage message = hash(arbiter_engaged, escrow_id, federation_id, contract_hash)
                         <br />
-                        fee claim message = hash(escrow_id, fee_amount) — signed and verified independently
+                        default_fallback = Refund | Split {"{ funder_split_bps, recipient_split_bps }"} | SwapArbiter {"{ arbiter_key, arbiter_fee_key, arbiter_fee }"}
                     </div>
                 </div>
             )}
         </div>
     );
 }
-

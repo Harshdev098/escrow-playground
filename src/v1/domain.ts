@@ -1,539 +1,687 @@
-export const Outcome = { RELEASE: "Release", REFUND: "Refund" } as const;
+export const Outcome = { RELEASE: "Release", REFUND: "Refund", SPLIT: "Split" } as const;
 export type OutcomeType = (typeof Outcome)[keyof typeof Outcome];
 
 export const ContractStatus = {
     ACTIVE: "Active",
+    DISPUTED: "Disputed",
     RELEASED: "Released",
     REFUNDED: "Refunded",
+    SPLIT: "Split",
 } as const;
-
 export type ContractStatusType = (typeof ContractStatus)[keyof typeof ContractStatus];
 
+export type Role = "funder" | "recipient" | "arbiter";
+export type PartyId = Role | "federation";
+export type FallbackKind = "Refund" | "Split" | "SwapArbiter";
+/**
+ * valid  = made by the arbiter that is currently active
+ * forged = not made by the arbiter's key at all
+ * stale  = made by the ORIGINAL arbiter after it was swapped out
+ */
+export type Signature = "valid" | "forged" | "stale";
+
+export const SPLIT_BPS_DENOMINATOR = 10000;
+export const DEMO_SPLIT = { funderBps: 5000, recipientBps: 5000 } as const;
+
+export const FALLBACK_OPTIONS: { kind: FallbackKind; label: string }[] = [
+    { kind: "Refund", label: "Fallback: Refund" },
+    { kind: "Split", label: "Fallback: Split 50 / 50" },
+    { kind: "SwapArbiter", label: "Fallback: SwapArbiter" },
+];
+
+export type ErrorCode =
+    | "ContractNotFound"
+    | "AlreadyExists"
+    | "ContractDisputed"
+    | "ContractAlreadyResolved"
+    | "InvalidSignature"
+    | "TimeoutNotReached"
+    | "ContractNotDisputed"
+    | "ResolutionDeadlinePassed"
+    | "FallbackNotAvailable"
+    | "NoPendingClaim";
+
+export const ERROR_MESSAGES: Record<ErrorCode, string> = {
+    ContractNotFound: "Contract not found",
+    AlreadyExists: "Contract already exists",
+    ContractDisputed: "Contract is under dispute; funder release is no longer valid",
+    ContractAlreadyResolved: "Contract already resolved, claim the amount if not!",
+    InvalidSignature: "Invalid signature",
+    TimeoutNotReached: "Timeout not reached",
+    ContractNotDisputed: "Contract not disputed",
+    ResolutionDeadlinePassed: "The resolution deadline has passed",
+    FallbackNotAvailable: "Fallback resolution is not yet available",
+    NoPendingClaim: "No pending claim",
+};
+
 export interface Payout {
-    to: "seller" | "buyer" | "arbiter";
+    to: Role;
     amount: number;
     note?: string;
 }
 
-export interface EscrowEvent {
-    id: string;
-    at: number;
-    actor: string;
-    label: string;
-    authRequired: string;
-    valid: boolean;
-    reason: string;
-    payout: Payout | null;
+export interface ClaimEntry {
+    party: Role;
+    amount: number;
 }
 
+export interface EscrowConfig {
+    amount: number;
+    arbiterFee: number;
+    /** Fee of the replacement arbiter (only used by the SwapArbiter fallback). */
+    swapArbiterFee: number;
+    timeoutSeconds: number;
+    resolutionSeconds: number;
+    defaultFallback: FallbackKind;
+}
+
+export const DEFAULT_CONFIG: EscrowConfig = {
+    amount: 100,
+    arbiterFee: 2,
+    swapArbiterFee: 3,
+    timeoutSeconds: 30,
+    resolutionSeconds: 300,
+    defaultFallback: "Refund",
+};
+
 export interface EscrowState {
+    /** False until the creation packet has been accepted — nothing exists before that. */
+    created: boolean;
     escrowId: string;
     contractHash: string;
     amount: number;
     arbiterFee: number;
+    swapArbiterFee: number;
     timeoutSeconds: number;
-    createdAt: number;
+    resolutionSeconds: number;
+    defaultFallback: FallbackKind;
+    /** Arbiter can be engaged once now >= timeoutAt. */
     timeoutAt: number;
+    /** Set when the arbiter is engaged: the active arbiter's decision is only valid until then. */
+    resolveBy: number | null;
+    /** True once the SwapArbiter fallback has been used. It can only happen once. */
+    swapped: boolean;
     status: ContractStatusType;
-    pendingArbiterFee: number | null;
-    events: EscrowEvent[];
+    /** Mirrors the server's ClaimPool: written by a resolution, drained by ClaimPayout. */
+    claimPool: ClaimEntry[] | null;
+    /** What the federation still holds for this escrow. */
+    locked: number;
+    /** Ecash wallets of the three parties. */
+    wallets: Record<Role, number>;
 }
 
-export interface CreateEscrowStateConfig {
-    amount?: number;
-    timeoutSeconds?: number;
-    arbiterFee?: number;
+export function createEscrowState(cfg: Partial<EscrowConfig> = {}): EscrowState {
+    const c: EscrowConfig = { ...DEFAULT_CONFIG, ...cfg };
+    return {
+        created: false,
+        escrowId: "esc_" + Math.random().toString(16).slice(2, 10),
+        contractHash: "0x" + Math.random().toString(16).slice(2, 10) + "…",
+        amount: c.amount,
+        arbiterFee: c.arbiterFee,
+        swapArbiterFee: c.swapArbiterFee,
+        timeoutSeconds: c.timeoutSeconds,
+        resolutionSeconds: c.resolutionSeconds,
+        defaultFallback: c.defaultFallback,
+        timeoutAt: Date.now() + c.timeoutSeconds * 1000,
+        resolveBy: null,
+        swapped: false,
+        status: ContractStatus.ACTIVE,
+        claimPool: null,
+        locked: 0,
+        wallets: { funder: c.amount, recipient: 0, arbiter: 0 },
+    };
 }
 
-export interface BuyerReleaseAction {
-    type: "BUYER_RELEASE";
-    actor: string;
-    label: string;
-    authRequired: string;
+export function isSettled(status: ContractStatusType): boolean {
+    return status !== ContractStatus.ACTIVE && status !== ContractStatus.DISPUTED;
 }
 
-export interface SellerWithdrawUnauthorizedAction {
-    type: "SELLER_WITHDRAW_UNAUTHORIZED";
-    actor: string;
-    label: string;
-    authRequired: string;
+export function fmtDuration(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return s === 0 ? `${m} min` : `${m}m ${s}s`;
 }
 
-export interface ArbiterDecisionAction {
-    type: "ARBITER_DECISION";
-    outcome: OutcomeType;
-    actor: string;
-    label: string;
-    authRequired: string;
+const secondsLeft = (target: number, now: number) => Math.max(0, Math.ceil((target - now) / 1000));
+
+/** The fee of whichever arbiter is currently active. */
+export function activeArbiterFee(state: EscrowState): number {
+    return state.swapped ? state.swapArbiterFee : state.arbiterFee;
 }
 
-export interface ArbiterDecisionBadSigAction {
-    type: "ARBITER_DECISION_BAD_SIG";
-    actor: string;
-    label: string;
-    authRequired: string;
+/** True while a Disputed contract can still have its arbiter swapped. */
+export function swapAvailable(state: EscrowState): boolean {
+    return state.defaultFallback === "SwapArbiter" && !state.swapped;
 }
 
-export interface ArbiterFeeClaimAction {
-    type: "ARBITER_FEE_CLAIM";
-    actor: string;
-    label: string;
-    authRequired: string;
+/* ---------------------------------------------------------------------------
+   Outcomes and claims
+   --------------------------------------------------------------------------- */
+
+export function outcomeStatus(outcome: OutcomeType): ContractStatusType {
+    if (outcome === Outcome.RELEASE) return ContractStatus.RELEASED;
+    if (outcome === Outcome.REFUND) return ContractStatus.REFUNDED;
+    return ContractStatus.SPLIT;
 }
 
-export interface ArbiterFeeClaimBadSigAction {
-    type: "ARBITER_FEE_CLAIM_BAD_SIG";
-    actor: string;
-    label: string;
-    authRequired: string;
+/** What the fallback pays out when it actually settles. A used-up swap ends in a Refund. */
+function fallbackOutcome(kind: FallbackKind): OutcomeType {
+    return kind === "Split" ? Outcome.SPLIT : Outcome.REFUND;
 }
 
-export interface ArbiterFeeClaimTooEarlyAction {
-    type: "ARBITER_FEE_CLAIM_TOO_EARLY";
-    actor: string;
-    label: string;
-    authRequired: string;
+/** Mirrors calculate_claims: the fee is carved out of the amount (only when an arbiter decided). */
+export function calculateClaims(state: EscrowState, outcome: OutcomeType, includeFee: boolean): ClaimEntry[] {
+    const fee = includeFee ? activeArbiterFee(state) : 0;
+    const payout = state.amount - fee;
+    let claims: ClaimEntry[] = [];
+    if (outcome === Outcome.RELEASE) {
+        claims = [{ party: "recipient", amount: payout }];
+    } else if (outcome === Outcome.REFUND) {
+        claims = [{ party: "funder", amount: payout }];
+    } else {
+        const funderAmount = Math.floor((payout * DEMO_SPLIT.funderBps) / SPLIT_BPS_DENOMINATOR);
+        claims = [
+            { party: "funder", amount: funderAmount },
+            { party: "recipient", amount: payout - funderAmount },
+        ];
+    }
+    if (includeFee) claims.push({ party: "arbiter", amount: fee });
+    return claims.filter((c) => c.amount > 0);
 }
 
-export interface TimeoutNoopAction {
-    type: "TIMEOUT_NOOP";
-    actor: string;
-    label: string;
-    authRequired: string;
-}
+const claimsText = (claims: ClaimEntry[]) => claims.map((c) => `${c.party} ${c.amount}`).join(" · ");
 
+/* ---------------------------------------------------------------------------
+   Actions
+   --------------------------------------------------------------------------- */
+
+/** `actor` is whoever submits the transaction. */
 export type EscrowAction =
-    | BuyerReleaseAction
-    | SellerWithdrawUnauthorizedAction
-    | ArbiterDecisionAction
-    | ArbiterDecisionBadSigAction
-    | ArbiterFeeClaimAction
-    | ArbiterFeeClaimBadSigAction
-    | ArbiterFeeClaimTooEarlyAction
-    | TimeoutNoopAction;
+    | { type: "CREATE_CONTRACT"; actor: "funder" }
+    | { type: "FUNDER_RELEASE"; actor: Role; signature: Signature }
+    | { type: "ENGAGE_ARBITER"; actor: "funder" | "recipient" }
+    | { type: "ARBITER_OUTCOME"; actor: Role; outcome: OutcomeType; signature: Signature }
+    | { type: "TRIGGER_FALLBACK"; actor: "funder" | "recipient" }
+    | { type: "CLAIM_PAYOUT"; actor: Role };
 
 export interface ActionEvaluation {
     valid: boolean;
+    /** Teaching explanation of what happened and why. */
     reason: string;
-    nextStatus?: ContractStatusType;
+    error?: ErrorCode;
+    /** State changes applied when the action is accepted. */
+    patch?: Partial<EscrowState>;
     payout?: Payout;
-    setPendingFee?: number | null;
-    noop?: boolean;
+    claims?: ClaimEntry[];
 }
 
-export function createEscrowState({
-    amount = 100,
-    timeoutSeconds = 60,
-    arbiterFee = 2,
-}: CreateEscrowStateConfig = {}): EscrowState {
-    return {
-        escrowId: "esc_" + Math.random().toString(16).slice(2, 10),
-        contractHash: "0x" + Math.random().toString(16).slice(2, 10) + "…",
-        amount,
-        arbiterFee,
-        timeoutSeconds,
-        createdAt: Date.now(),
-        timeoutAt: Date.now() + timeoutSeconds * 1000,
-        status: ContractStatus.ACTIVE,
-        pendingArbiterFee: null,
-        events: [],
-    };
+function reject(error: ErrorCode, why: string): ActionEvaluation {
+    return { valid: false, error, reason: why };
 }
 
-export function evaluateAction(state: EscrowState, action: EscrowAction): ActionEvaluation {
-    const timedOut = Date.now() >= state.timeoutAt;
-    const terminal = state.status !== ContractStatus.ACTIVE;
+function ensureActive(state: EscrowState, disputedWhy: string): ActionEvaluation | null {
+    if (state.status === ContractStatus.DISPUTED) return reject("ContractDisputed", disputedWhy);
+    if (state.status !== ContractStatus.ACTIVE) {
+        return reject(
+            "ContractAlreadyResolved",
+            `The contract is already ${state.status}. A resolved contract never goes back to Active, so nothing can resolve it a second time — whatever is still owed is collected through claims.`,
+        );
+    }
+    return null;
+}
+
+/**
+ * The single source of truth for "who can do what, when". Pure: it returns what
+ * would happen (and the state patch), applyEvaluation() commits it.
+ */
+export function evaluateAction(state: EscrowState, action: EscrowAction, now: number = Date.now()): ActionEvaluation {
+    if (action.type === "CREATE_CONTRACT") {
+        if (state.created) {
+            return reject("AlreadyExists", "An escrow_id can only be created once — the module refuses to overwrite an existing contract.");
+        }
+        const opId = "op_" + Math.random().toString(16).slice(2, 10);
+        return {
+            valid: true,
+            reason: `${state.amount} sats moves from the funder into escrow and the federation returns operation_id=${opId}.`,
+            patch: {
+                created: true,
+                timeoutAt: now + state.timeoutSeconds * 1000,
+                locked: state.amount,
+                wallets: { ...state.wallets, funder: state.wallets.funder - state.amount },
+            },
+        };
+    }
+
+    if (!state.created) {
+        return reject("ContractNotFound", "No contract exists for this escrow_id yet.");
+    }
 
     switch (action.type) {
-        case "BUYER_RELEASE": {
-            if (terminal) {
-                return {
-                    valid: false,
-                    reason: `Contract is already terminal (${state.status}). load_contract still finds the row, but its status is no longer Active, so a second resolution is not a "wrong signature," it's not a defined transition anymore.`,
-                };
+        case "FUNDER_RELEASE": {
+            const blocked = ensureActive(
+                state,
+                "Once the arbiter has been engaged, the funder can no longer release the funds. Only the arbiter's signed outcome — or, after the deadline, the default fallback — can resolve the contract.",
+            );
+            if (blocked) return blocked;
+            if (action.signature === "forged") {
+                return reject(
+                    "InvalidSignature",
+                    "verify_signature(funder_key, …) fails. The federation checks the signature against the funder_key stored in the contract. A signature from any other key — including the recipient's own — doesn't verify, so the recipient can't release the funds alone.",
+                );
             }
             return {
                 valid: true,
-                reason:
-                    "verify_signature(buyer_key, msg_bytes, buyer_signature) passes. Contract got in released state and pays the FULL amount to seller_key — there's no arbiter_fee subtraction on this path, because the arbiter was never involved. Note: unlike the arbiter's authority, the buyer's signature is never time-gated — it verifies before or after the timeout, at any point the contract is still Active.",
-                nextStatus: ContractStatus.RELEASED,
-                payout: { to: "seller", amount: state.amount },
-                setPendingFee: null,
-            };
-        }
-
-        case "SELLER_WITHDRAW_UNAUTHORIZED": {
-            return {
-                valid: false,
-                reason:
-                    "There is no Resolution variant the seller can construct alone. Resolution is BuyerRelease, ArbiterOutcome, or ArbiterFeeClaim — every one of them requires a signature the seller doesn't hold.",
-            };
-        }
-
-        case "ARBITER_DECISION": {
-            if (terminal) {
-                return {
-                    valid: false,
-                    reason: `Contract is already terminal (${state.status}). escrow_id was consumed by the first resolution — the module has no record of an "Active" contract to load anymore.`,
-                };
-            }
-            if (!timedOut) {
-                return {
-                    valid: false,
-                    reason:
-                        'anyhow::ensure!(now >= contract.timeout, "arbiter cannot act before timeout") runs before the transaction is even built, and process_input re-checks it server-side too. Both layers refuse — no arbiter signature verifies yet, so there is nothing for a winner to submit.',
-                };
-            }
-            const outcome = action.outcome;
-            const payoutAmount = state.amount - state.arbiterFee;
-            return {
-                valid: true,
-                reason: `verify_signature(arbiter_key, msg_bytes, arbiter_signature) passes for resolution_message(${outcome}). The arbiter signed this off-chain; the winning party is the one submitting it here. The winner is paid amount − arbiter_fee (${payoutAmount}) immediately, and a PendingArbiterFee row is written for the remaining ${state.arbiterFee} — the arbiter doesn't receive that yet, they have to claim it separately.`,
-                nextStatus: outcome === Outcome.RELEASE ? ContractStatus.RELEASED : ContractStatus.REFUNDED,
-                payout: {
-                    to: outcome === Outcome.RELEASE ? "seller" : "buyer",
-                    amount: payoutAmount,
+                reason: `The contract moves Active → Released and pays the full ${state.amount} sats to the recipient in this same transaction. There is no arbiter fee and no claim pool — the arbiter was never involved. Unlike the arbiter's authority, the funder's release isn't time-gated: it works before or after the timeout, right up until a party engages the arbiter after timeout.`,
+                patch: {
+                    status: ContractStatus.RELEASED,
+                    locked: state.locked - state.amount,
+                    wallets: { ...state.wallets, recipient: state.wallets.recipient + state.amount },
                 },
-                setPendingFee: state.arbiterFee,
+                payout: { to: "recipient", amount: state.amount },
             };
         }
 
-        case "ARBITER_DECISION_BAD_SIG": {
-            return {
-                valid: false,
-                reason:
-                    "verify_signature reconstructs resolution_message(outcome) from the outcome declared in the input and checks it against arbiter_key. If the signature doesn't match — whether it's outright invalid or was produced for a different outcome",
-            };
-        }
-
-        case "ARBITER_FEE_CLAIM_TOO_EARLY": {
-            return {
-                valid: false,
-                reason:
-                    "There is nothing for the arbiter to claim, ever, on this path.",
-            };
-        }
-
-        case "ARBITER_FEE_CLAIM": {
-            if (state.pendingArbiterFee == null) {
-                return {
-                    valid: false,
-                    reason:
-                        "No PendingArbiterFee row exists for this escrow_id — either it was already claimed, or (as on the happy path) an arbiter decision never ran to create one.",
-                };
-            }
-            const fee = state.pendingArbiterFee;
-            return {
-                valid: true,
-                reason: `A fresh signature is checked here — this is a separate message (ArbiterFeeClaim{ escrow_id, fee_amount }), not a reuse of the resolution signature. verify_signature(arbiter_key, ...) passes, the ${fee}-sat fee is paid to the arbiter, and the PendingArbiterFeeKey row is deleted so it can't be claimed twice.`,
-                payout: { to: "arbiter", amount: fee, note: "fee claim" },
-                setPendingFee: null,
-            };
-        }
-
-        case "ARBITER_FEE_CLAIM_BAD_SIG": {
-            return {
-                valid: false,
-                reason:
-                    "The fee claim requires its own valid arbiter signature over the ArbiterFeeClaim message — reusing or forging a signature here fails verify_signature and the pending fee stays exactly where it was, unclaimed.",
-            };
-        }
-
-        case "TIMEOUT_NOOP": {
-            if (!timedOut) {
-                return {
-                    valid: false,
-                    reason: "Timeout has not elapsed yet. Nothing changes automatically before then — the contract simply continues waiting for a buyer release.",
-                };
+        case "ENGAGE_ARBITER": {
+            const blocked = ensureActive(state, "The arbiter has already been engaged for this contract.");
+            if (blocked) return blocked;
+            if (now < state.timeoutAt) {
+                return reject(
+                    "TimeoutNotReached",
+                    `The arbiter can only be engaged once now >= timeout, and there are ${secondsLeft(state.timeoutAt, now)}s left. This is the only gate that keeps the arbiter out of a contract: before the timeout nobody can bring them in.`,
+                );
             }
             return {
                 valid: true,
-                reason:
-                    "Timeout has elapsed. This does not move funds by itself — it only changes which signatures the module will accept: the buyer's Release signature closes, the arbiter's signature opens.",
-                nextStatus: state.status,
-                payout: undefined,
-                noop: true,
+                reason: `The timeout has passed, the disputant is the funder or the recipient, and their signature over the engage message verifies. The contract moves Active → Disputed { resolve_by: now + ${fmtDuration(state.resolutionSeconds)}, swapped: false }. From now on the funder's release is rejected: only the arbiter's signed outcome — or, once resolve_by passes, the default fallback — can resolve the contract.`,
+                patch: {
+                    status: ContractStatus.DISPUTED,
+                    resolveBy: now + state.resolutionSeconds * 1000,
+                },
             };
         }
 
-        default:
-            return { valid: false, reason: "Unrecognized action." };
+        case "ARBITER_OUTCOME": {
+            if (state.status !== ContractStatus.DISPUTED) {
+                if (isSettled(state.status)) {
+                    return reject("ContractAlreadyResolved", `The contract is already ${state.status}, so a second outcome has nothing to resolve.`);
+                }
+                return reject(
+                    "ContractNotDisputed",
+                    "An arbiter outcome is only accepted for a Disputed contract — one a party has engaged the arbiter for, which requires the timeout to have passed. That's why the arbiter can't act before the timeout even with a perfectly valid signature.",
+                );
+            }
+            if (state.resolveBy !== null && now > state.resolveBy) {
+                return reject(
+                    "ResolutionDeadlinePassed",
+                    "The active arbiter had until resolve_by to decide. After that their signature is no longer accepted — the contract can only be settled by the default fallback.",
+                );
+            }
+            if (action.signature === "stale") {
+                return reject(
+                    "InvalidSignature",
+                    "verify_signature(arbiter_key, …) fails. After the swap, the active arbiter_key is the replacement's. The original arbiter's key no longer has any authority over this contract, so a ruling signed by it doesn't verify — even though it was valid a moment ago.",
+                );
+            }
+            if (action.signature === "forged") {
+                return reject(
+                    "InvalidSignature",
+                    `verify_signature(${state.swapped ? "the replacement arbiter_key" : "arbiter_key"}, …) fails. The message is rebuilt from the declared outcome (${action.outcome}) and the contract, so a signature that wasn't made by the active arbiter — or was made for a different outcome — doesn't verify. Anyone may submit a ruling, but only the arbiter can sign one.`,
+                );
+            }
+            const status = outcomeStatus(action.outcome);
+            const claims = calculateClaims(state, action.outcome, true);
+            const fee = activeArbiterFee(state);
+            return {
+                valid: true,
+                reason: `verify_signature(${state.swapped ? "the replacement arbiter_key" : "arbiter_key"}, …) passes for hash(federation_id, escrow_id, ${action.outcome}, contract_hash), inside the resolution window. The contract moves Disputed → ${status}. This transaction pays nobody: it writes one claim pool (${claimsText(claims)}) that includes the arbiter's ${fee} sats fee, and the ${state.locked} ecash stays locked until each claimant collects with their own ClaimPayout. Any party in the contract could have submitted this ruling — here the arbiter does.`,
+                patch: { status, claimPool: claims },
+                claims,
+            };
+        }
+
+        case "TRIGGER_FALLBACK": {
+            if (state.status !== ContractStatus.DISPUTED) {
+                return reject("ContractNotDisputed", "The default fallback only exists for a Disputed contract.");
+            }
+            if (state.resolveBy !== null && now <= state.resolveBy) {
+                return reject(
+                    "FallbackNotAvailable",
+                    state.swapped
+                        ? `The replacement arbiter still has until resolve_by to decide (${secondsLeft(state.resolveBy, now)}s left). The swap was already used, so there is no second swap — the fallback only opens once now > resolve_by.`
+                        : `The arbiter still has until resolve_by to decide (${secondsLeft(state.resolveBy, now)}s left). The fallback only opens once now > resolve_by.`,
+                );
+            }
+
+            // SwapArbiter, first use: no payout — replace the arbiter and open a new window.
+            if (swapAvailable(state)) {
+                return {
+                    valid: true,
+                    reason: `resolve_by has passed and the first arbiter never ruled. The default fallback is SwapArbiter and the swap hasn't been used yet, so the module pays nobody. It replaces the arbiter: arbiter_key, arbiter_fee_key and the fee (${state.swapArbiterFee} sats) become the swap ones, and the contract stays Disputed { resolve_by: now + ${fmtDuration(state.resolutionSeconds)}, swapped: true }. A ruling signed by the original arbiter now fails with InvalidSignature. A second swap is impossible, which bounds the process.`,
+                    patch: {
+                        swapped: true,
+                        resolveBy: now + state.resolutionSeconds * 1000,
+                    },
+                };
+            }
+
+            const outcome = fallbackOutcome(state.defaultFallback);
+            const status = outcomeStatus(outcome);
+            const claims = calculateClaims(state, outcome, false);
+            const why = state.swapped
+                ? `The replacement arbiter missed the deadline too. The swap is already used, so the fallback now settles as a Refund`
+                : `resolve_by has passed with no arbiter outcome. The contract settles by its default_fallback (${state.defaultFallback})`;
+            return {
+                valid: true,
+                reason: `${why}: Disputed → ${status}. The federation writes a claim pool with no arbiter fee — the arbiter didn't do the work, so the whole ${state.amount} goes to the parties (${claimsText(claims)}). Nothing is paid until each claimant claims.`,
+                patch: { status, claimPool: claims },
+                claims,
+            };
+        }
+
+        case "CLAIM_PAYOUT": {
+            const pool = state.claimPool;
+            const entry = pool?.find((e) => e.party === action.actor);
+            if (!pool || !entry) {
+                const why = pool
+                    ? `The pool has no entry for the ${action.actor}'s key — they either already claimed, or were never owed anything from this resolution.`
+                    : !isSettled(state.status)
+                        ? "No resolution has written a claim pool yet — claims only exist after an arbiter outcome or the fallback."
+                        : state.resolveBy === null
+                            ? "A funder release pays the recipient directly in the same transaction, so there was never anything to claim."
+                            : "Every share has already been claimed, so the pool was deleted.";
+                return reject("NoPendingClaim", why);
+            }
+            const remaining = pool.filter((e) => e.party !== action.actor);
+            const key = action.actor === "arbiter" ? "arbiter_fee_key" : action.actor === "funder" ? "funder_key" : "recipient_key";
+            return {
+                valid: true,
+                reason: `The pool has an entry for the ${key}: ${entry.amount} sats. The federation pays it to that key and removes the entry${remaining.length === 0 ? "; it was the last one, so the whole pool is deleted" : ""}. Nobody else can claim this share.`,
+                patch: {
+                    claimPool: remaining.length > 0 ? remaining : null,
+                    locked: state.locked - entry.amount,
+                    wallets: { ...state.wallets, [action.actor]: state.wallets[action.actor] + entry.amount },
+                },
+                payout: { to: action.actor, amount: entry.amount, note: "claim" },
+            };
+        }
     }
 }
 
-/** Applies an evaluated action to state, producing the next state + a log entry. */
-export function applyAction(
-    state: EscrowState,
-    action: EscrowAction,
-    evaluation: ActionEvaluation,
-    now = Date.now(),
-): { next: EscrowState; entry: EscrowEvent } {
-    const entry: EscrowEvent = {
-        id: "evt_" + Math.random().toString(16).slice(2, 8),
-        at: now,
-        actor: action.actor,
-        label: action.label,
-        authRequired: action.authRequired,
-        valid: evaluation.valid,
-        reason: evaluation.reason,
-        payout: evaluation.payout || null,
-    };
+export function applyEvaluation(state: EscrowState, evaluation: ActionEvaluation): EscrowState {
+    return evaluation.valid && evaluation.patch ? { ...state, ...evaluation.patch } : state;
+}
 
-    if (!evaluation.valid || evaluation.noop) {
-        return { next: state, entry };
+/* ---------------------------------------------------------------------------
+   Phase — one label for "where are we right now", used by the UI
+   --------------------------------------------------------------------------- */
+
+export type Phase = "not-created" | "active-waiting" | "active-open" | "disputed-open" | "disputed-expired" | "claiming" | "done";
+
+export function getPhase(state: EscrowState, now: number): Phase {
+    if (!state.created) return "not-created";
+    if (state.status === ContractStatus.ACTIVE) return now < state.timeoutAt ? "active-waiting" : "active-open";
+    if (state.status === ContractStatus.DISPUTED) {
+        return state.resolveBy !== null && now <= state.resolveBy ? "disputed-open" : "disputed-expired";
     }
-
-    const next: EscrowState = {
-        ...state,
-        status: evaluation.nextStatus ?? state.status,
-        pendingArbiterFee:
-            evaluation.setPendingFee !== undefined ? evaluation.setPendingFee : state.pendingArbiterFee,
-    };
-    return { next, entry };
+    return state.claimPool && state.claimPool.length > 0 ? "claiming" : "done";
 }
 
 /* ============================================================================
    PACKET MODEL
-   Inspired by fedimint-playground's design: every protocol action becomes a
-   Packet that PARKS at its sender until the user approves it, then animates
-   to the federation and back with a real/rejected response. The user is the
-   network — nothing fires automatically. Packets carry inspectable payload
-   fields mirroring the real Rust types (EscrowOutput/EscrowInput/Resolution).
+   Every protocol action becomes a Packet that PARKS at its sender until the
+   user approves it, then travels to its destination. Off-chain hand-offs
+   (the funder's release signature) are packets too, but the federation is
+   never involved, so they have no accept / reject outcome.
    ============================================================================ */
-
-export type PartyId = "buyer" | "seller" | "arbiter" | "federation";
-
-export type PacketStatus = "parked" | "in-flight" | "returning" | "accepted" | "rejected";
 
 export interface PacketField {
     key: string;
     value: string;
 }
 
+export type PacketStatus = "parked" | "in-flight" | "accepted" | "rejected";
+
 export interface PacketDef {
     id: string;
     from: PartyId;
-    /** Where this packet travels to. Defaults to "federation" (an on-chain submission).
-        "buyer" -> "seller" is used for the off-chain signature hand-off before the
-        seller submits it on-chain themselves. */
     to: PartyId;
-    /** False for an off-chain hand-off (e.g. buyer sharing a signature with the seller) —
-        no federation verification happens, so there's no accept/reject outcome, just a relay. */
+    /** False for an off-chain hand-off between parties. */
     submits: boolean;
-    /** What kind of domain action this packet performs when approved. Only meaningful when submits is true. */
+    /** What the federation evaluates. Only meaningful when submits is true. */
     action: EscrowAction;
-    /** Short label shown on the packet chip, e.g. "EscrowOutput". */
     kind: string;
-    /** One-line human label, e.g. "Create escrow contract". */
     title: string;
-    /** Inspectable payload fields shown when the packet is clicked. */
     fields: PacketField[];
 }
 
 export interface PacketInstance extends PacketDef {
     status: PacketStatus;
-    /** Filled in once the packet resolves. */
     result?: {
         valid: boolean;
         reason: string;
+        error?: ErrorCode;
         payout?: Payout;
+        claims?: ClaimEntry[];
     };
 }
 
-function fieldsForAction(state: EscrowState, action: EscrowAction): PacketField[] {
-    switch (action.type) {
-        case "BUYER_RELEASE":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: "BuyerRelease { buyer_signature }" },
-                { key: "message signed", value: `hash(federation_id, escrow_id, Release, contract_hash)` },
-            ];
-        case "SELLER_WITHDRAW_UNAUTHORIZED":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: "— (no variant exists for this)" },
-                { key: "signing key used", value: "seller_key (insufficient — not a recognized authority for any Resolution)" },
-            ];
-        case "ARBITER_DECISION":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: `ArbiterOutcome { outcome: ${action.outcome}, arbiter_signature }` },
-                { key: "message signed", value: `hash(federation_id, escrow_id, ${action.outcome}, contract_hash)` },
-                { key: "requires", value: "now >= contract.timeout" },
-            ];
-        case "ARBITER_DECISION_BAD_SIG":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: "ArbiterOutcome { outcome, arbiter_signature: <invalid> }" },
-                { key: "signature", value: "does not verify against arbiter_key" },
-            ];
-        case "ARBITER_FEE_CLAIM":
-        case "ARBITER_FEE_CLAIM_TOO_EARLY":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: "ArbiterFeeClaim { arbiter_signature }" },
-                { key: "message signed", value: "hash(escrow_id, fee_amount) — independent of the resolution signature" },
-                { key: "requires", value: "a PendingArbiterFee row to exist for this escrow_id" },
-            ];
-        case "ARBITER_FEE_CLAIM_BAD_SIG":
-            return [
-                { key: "escrow_id", value: state.escrowId },
-                { key: "resolution", value: "ArbiterFeeClaim { arbiter_signature: <invalid> }" },
-                { key: "signature", value: "does not verify against arbiter_key" },
-            ];
-        case "TIMEOUT_NOOP":
-            return [{ key: "note", value: "not a submitted packet — the clock simply advances" }];
-        default:
-            return [];
+const KEY_NAME: Record<Role, string> = { funder: "funder_key", recipient: "recipient_key", arbiter: "arbiter_key" };
+const KEY_VALUE: Record<Role, string> = { funder: "bk_a1b2c3…", recipient: "sk_d4e5f6…", arbiter: "ak_9f8e7d…" };
+const FEE_KEY_VALUE = "af_5c4b3a…";
+const SWAP_ARBITER_KEY = "ak_2b7c10…";
+const SWAP_FEE_KEY_VALUE = "af_8d1e44…";
+
+function outcomeText(outcome: OutcomeType): string {
+    return outcome === Outcome.SPLIT
+        ? `Split { funder_split_bps: ${DEMO_SPLIT.funderBps}, recipient_split_bps: ${DEMO_SPLIT.recipientBps} }`
+        : outcome;
+}
+
+/** The default_fallback as it appears in the contract. */
+function fallbackValue(state: EscrowState): string {
+    switch (state.defaultFallback) {
+        case "Refund":
+            return "Refund — applies if the arbiter never decides";
+        case "Split":
+            return `Split { funder_split_bps: ${DEMO_SPLIT.funderBps}, recipient_split_bps: ${DEMO_SPLIT.recipientBps} } — applies if the arbiter never decides`;
+        case "SwapArbiter":
+            return `SwapArbiter { arbiter_key: ${SWAP_ARBITER_KEY}, arbiter_fee_key: ${SWAP_FEE_KEY_VALUE}, arbiter_fee: ${state.swapArbiterFee} sats } — if the first arbiter misses the deadline, a replacement gets one more window`;
     }
 }
 
-/** Payload fields for the off-chain hand-off: the buyer's raw signature, before
-    the seller wraps it into an EscrowInput and submits it themselves. */
-export function relaySignatureFields(state: EscrowState): PacketField[] {
+function creationFields(state: EscrowState): PacketField[] {
     return [
-        { key: "escrow_id", value: state.escrowId },
-        { key: "buyer_signature", value: "sig_" + "7c2a91…" + " (over outcome=Release)" },
-        { key: "delivered via", value: "out-of-band — not a federation transaction" },
-        { key: "next step", value: "seller wraps this into EscrowInput and submits it" },
+        { key: "funder_key", value: KEY_VALUE.funder },
+        { key: "recipient_key", value: KEY_VALUE.recipient },
+        { key: "arbiter_key", value: KEY_VALUE.arbiter },
+        { key: "arbiter_fee_key", value: FEE_KEY_VALUE },
+        { key: "amount", value: `${state.amount} sats` },
+        { key: "arbiter_fee", value: `${state.arbiterFee} sats` },
+        { key: "timeout", value: `${fmtDuration(state.timeoutSeconds)} from now — until then the arbiter can't be engaged` },
+        { key: "resolution_period", value: `${fmtDuration(state.resolutionSeconds)} — the arbiter's time to decide once engaged` },
+        { key: "default_fallback", value: fallbackValue(state) },
+        { key: "contract_hash", value: "hash(funder_key, recipient_key, arbiter_key, arbiter_fee, amount, timeout, federation_id, resolution_period, default_fallback, arbiter_fee_key)" },
     ];
 }
 
-/** Payload fields for the arbiter's off-chain hand-off to the winning party — a
-    signature over their decided outcome, not yet submitted anywhere. */
-export function arbiterRelayFields(state: EscrowState, outcome: OutcomeType, winner: "buyer" | "seller"): PacketField[] {
-    return [
-        { key: "escrow_id", value: state.escrowId },
-        { key: "arbiter_signature", value: "sig_" + "e91fa3…" + ` (over outcome=${outcome})` },
-        { key: "delivered via", value: `out-of-band, to the ${winner} — not a federation transaction` },
-        { key: "next step", value: `${winner} wraps this into EscrowInput and submits it` },
-    ];
+function fieldsForAction(state: EscrowState, action: EscrowAction): PacketField[] {
+    const escrowId = { key: "escrow_id", value: state.escrowId };
+    switch (action.type) {
+        case "CREATE_CONTRACT":
+            return creationFields(state);
+
+        case "FUNDER_RELEASE":
+            return [
+                escrowId,
+                { key: "resolution", value: "FunderRelease { funder_signature }" },
+                {
+                    key: "funder_signature",
+                    value:
+                        action.signature === "valid"
+                            ? "sig_7c2a91… (made by the funder_key, relayed by the funder)"
+                            : `<made with the ${KEY_NAME[action.actor]}, not the funder_key>`,
+                },
+                { key: "message signed", value: "hash(federation_id, escrow_id, Release, contract_hash)" },
+                { key: "requires", value: "contract Active — not time-gated" },
+            ];
+
+        case "ENGAGE_ARBITER":
+            return [
+                escrowId,
+                { key: "resolution", value: "ArbiterEngaged { disputant_pubkey, disputant_signature }" },
+                { key: "disputant_pubkey", value: `${KEY_VALUE[action.actor]} (${KEY_NAME[action.actor]})` },
+                { key: "message signed", value: "hash(arbiter_engaged, escrow_id, federation_id, contract_hash)" },
+                { key: "requires", value: "contract Active and now >= timeout" },
+                { key: "effect", value: `Active → Disputed { resolve_by: now + ${fmtDuration(state.resolutionSeconds)}, swapped: false }` },
+            ];
+
+        case "ARBITER_OUTCOME": {
+            const submitterKey =
+                action.actor === "arbiter"
+                    ? `${state.swapped ? SWAP_FEE_KEY_VALUE : FEE_KEY_VALUE} (arbiter_fee_key)`
+                    : `${KEY_VALUE[action.actor]} (${KEY_NAME[action.actor]})`;
+            const sigValue =
+                action.signature === "valid"
+                    ? state.swapped
+                        ? `sig_c3d2b8… (made by the replacement arbiter_key ${SWAP_ARBITER_KEY})`
+                        : "sig_e91fa3… (made by the arbiter_key)"
+                    : action.signature === "stale"
+                        ? `<made by the original arbiter_key ${KEY_VALUE.arbiter} — replaced by the swap>`
+                        : "<does not verify against the active arbiter_key>";
+            return [
+                escrowId,
+                { key: "resolution", value: `ArbiterOutcome { outcome: ${outcomeText(action.outcome)}, arbiter_signature, submitter_pubkey }` },
+                { key: "submitter_pubkey", value: submitterKey },
+                { key: "arbiter_signature", value: sigValue },
+                { key: "message signed", value: `hash(federation_id, escrow_id, ${action.outcome}, contract_hash)` },
+                { key: "requires", value: "contract Disputed and now <= resolve_by; any party in the contract may submit" },
+                { key: "amount in", value: "0 — the outcome writes a claim pool (fee included) instead of paying" },
+            ];
+        }
+
+        case "TRIGGER_FALLBACK": {
+            const swapping = swapAvailable(state);
+            return [
+                escrowId,
+                {
+                    key: "resolution",
+                    value: `ResolveFallbackPolicy { claimer_pubkey, fallback: ${state.defaultFallback === "SwapArbiter" ? (state.swapped ? "SwapArbiter (already used)" : "SwapArbiter { … }") : state.defaultFallback
+                        } }`,
+                },
+                { key: "claimer_pubkey", value: `${KEY_VALUE[action.actor]} (${KEY_NAME[action.actor]})` },
+                { key: "requires", value: "contract Disputed and now > resolve_by" },
+                {
+                    key: "effect",
+                    value: swapping
+                        ? `no payout — arbiter replaced, Disputed { resolve_by: now + ${fmtDuration(state.resolutionSeconds)}, swapped: true }`
+                        : `settles as ${fallbackOutcome(state.defaultFallback)} — claim pool without an arbiter fee`,
+                },
+            ];
+        }
+
+        case "CLAIM_PAYOUT": {
+            const entry = state.claimPool?.find((e) => e.party === action.actor);
+            const feeKey = state.swapped ? SWAP_FEE_KEY_VALUE : FEE_KEY_VALUE;
+            return [
+                escrowId,
+                { key: "resolution", value: "ClaimPayout { claimer_pubkey }" },
+                {
+                    key: "claimer_pubkey",
+                    value: action.actor === "arbiter" ? `${feeKey} (arbiter_fee_key)` : `${KEY_VALUE[action.actor]} (${KEY_NAME[action.actor]})`,
+                },
+                { key: "requires", value: "an entry for this key in the claim pool" },
+                { key: "pays", value: entry ? `${entry.amount} sats` : "— (no entry for this key)" },
+            ];
+        }
+    }
 }
 
-/** Payload fields for the creation packet — always the buyer's first move. */
-export function creationFields(cfg: { amount: number; arbiterFee: number; timeoutSeconds: number }): PacketField[] {
-    return [
-        { key: "buyer_key", value: "bk_" + "a1b2c3…" },
-        { key: "seller_key", value: "sk_" + "d4e5f6…" },
-        { key: "arbiter_key", value: "ak_" + "9f8e7d…" },
-        { key: "amount", value: `${cfg.amount} ecash` },
-        { key: "arbiter_fee", value: `${cfg.arbiterFee} ecash` },
-        { key: "timeout", value: `${cfg.timeoutSeconds}s from now` },
-        { key: "contract_hash", value: "hash(buyer_key, seller_key, arbiter_key, amount, timeout, federation_id)" },
-    ];
+function titleForAction(state: EscrowState, action: EscrowAction): string {
+    switch (action.type) {
+        case "CREATE_CONTRACT":
+            return "Create escrow contract";
+        case "FUNDER_RELEASE":
+            return action.signature === "valid" ? "FunderRelease" : "FunderRelease (forged signature)";
+        case "ENGAGE_ARBITER":
+            return "ArbiterEngaged";
+        case "ARBITER_OUTCOME": {
+            const tag = action.signature === "forged" ? " (forged signature)" : action.signature === "stale" ? " (signed by the swapped-out arbiter)" : "";
+            return `ArbiterOutcome → ${action.outcome}${tag}`;
+        }
+        case "TRIGGER_FALLBACK":
+            return swapAvailable(state) ? "ResolveFallbackPolicy → SwapArbiter" : "ResolveFallbackPolicy";
+        case "CLAIM_PAYOUT": {
+            const entry = state.claimPool?.find((e) => e.party === action.actor);
+            return entry ? `ClaimPayout · ${entry.amount} sats` : "ClaimPayout";
+        }
+    }
 }
 
-/** Builds a packet definition for a given action, with real inspectable fields.
-    Defaults to an on-chain submission straight to the federation; pass to/submits
-    explicitly for an off-chain relay hop (e.g. buyer -> seller). */
-export function buildPacket(
-    id: string,
-    from: PartyId,
-    action: EscrowAction,
-    kind: string,
-    title: string,
-    state: EscrowState,
-    opts?: { to?: PartyId; submits?: boolean },
-): PacketDef {
+/** A packet that is submitted to the federation by `action.actor`. */
+export function packetForAction(id: string, action: EscrowAction, state: EscrowState): PacketDef {
     return {
         id,
-        from,
-        to: opts?.to ?? "federation",
-        submits: opts?.submits ?? true,
+        from: action.actor,
+        to: "federation",
+        submits: true,
         action,
-        kind,
-        title,
+        kind: action.type === "CREATE_CONTRACT" ? "EscrowOutput" : "EscrowInput",
+        title: titleForAction(state, action),
         fields: fieldsForAction(state, action),
     };
 }
 
-/* ============================================================================
-   LIVE AUTHORIZATION STATUS
-   Computes, at any instant, whether each actor's canonical action is
-   currently valid and why. This is the core teaching primitive: instead of
-   explaining only the action just taken, it explains the whole board,
-   continuously, so "what can happen right now and why" never requires a click.
-   ============================================================================ */
-
-export interface ActorStatus {
-    actor: "buyer" | "seller" | "arbiter" | "arbiter-fee";
-    label: string;
-    actionLabel: string;
-    live: boolean;
-    reason: string;
+/** Off-chain: the funder hands their release signature to the recipient. */
+export function funderRelayPacket(id: string, state: EscrowState): PacketDef {
+    return {
+        id,
+        from: "funder",
+        to: "recipient",
+        submits: false,
+        action: { type: "FUNDER_RELEASE", actor: "recipient", signature: "valid" },
+        kind: "funder_signature",
+        title: "Signed release, shared off-chain",
+        fields: [
+            { key: "escrow_id", value: state.escrowId },
+            { key: "funder_signature", value: "sig_7c2a91… (over outcome=Release)" },
+            { key: "delivered via", value: "out-of-band — not a federation transaction" },
+            { key: "next step", value: "the recipient wraps it into FunderRelease and submits it" },
+        ],
+    };
 }
 
-export function computeLiveStatus(state: EscrowState, now: number): ActorStatus[] {
-    const timedOut = now >= state.timeoutAt;
-    const terminal = state.status !== ContractStatus.ACTIVE;
-
-    const buyer: ActorStatus = terminal
-        ? { actor: "buyer", label: "Buyer", actionLabel: "Sign release", live: false, reason: `Contract is ${state.status.toLowerCase()} — escrow_id is consumed, no signature moves these funds again.` }
-        : {
-            actor: "buyer",
-            label: "Buyer",
-            actionLabel: "Sign release",
-            live: true,
-            reason:
-                "Buyer's signature over outcome=Release verifies right now, and always will while the contract is Active — this path is never time-gated, before or after the timeout.",
-        };
-
-    const seller: ActorStatus = {
-        actor: "seller",
-        label: "Seller",
-        actionLabel: "Withdraw directly",
-        live: false,
-        reason: "No Resolution variant exists that the seller can construct alone — this is never live, at any point in the contract's life.",
-    };
-
-    const arbiter: ActorStatus = terminal
-        ? { actor: "arbiter", label: "Arbiter", actionLabel: "Decide outcome", live: false, reason: `Contract is ${state.status.toLowerCase()} — a decision has already been recorded, if one was ever needed.` }
-        : {
-            actor: "arbiter",
-            label: "Arbiter",
-            actionLabel: "Decide outcome",
-            live: timedOut,
-            reason: timedOut
-                ? "Timeout has passed. now >= contract.timeout holds, so the arbiter's signature over an outcome now verifies — in practice they'd sign and relay it to the winner, who submits it; this board shows the signature becoming valid, not who submits it."
-                : "Timeout hasn't passed. Both client and server refuse to even check an arbiter signature yet.",
-        };
-
-    const arbiterFee: ActorStatus = {
-        actor: "arbiter-fee",
-        label: "Arbiter",
-        actionLabel: "Claim fee",
-        live: state.pendingArbiterFee != null,
-        reason:
-            state.pendingArbiterFee != null
-                ? `A PendingArbiterFee row of ${state.pendingArbiterFee} exists for this escrow_id — the arbiter can claim it with a fresh signature at any time now.`
-                : state.status === ContractStatus.RELEASED && terminal
-                    ? "This escrow resolved via buyer release, which never creates a pending fee — there's nothing here to claim."
-                    : "No pending fee exists yet. This only appears after an arbiter decision has resolved the contract.",
-    };
-
-    return [buyer, seller, arbiter, arbiterFee];
+/** The next unclaimed entry of the claim pool, as a ClaimPayout packet. */
+export function nextClaimPacket(state: EscrowState): PacketDef | null {
+    const entry = state.claimPool?.[0];
+    if (!entry) return null;
+    return packetForAction(`pk_claim_${entry.party}`, { type: "CLAIM_PAYOUT", actor: entry.party }, state);
 }
 
 /* ============================================================================
    GUIDED SCRIPT
-   A fixed sequence of steps used to teach the protocol before sandbox mode
-   unlocks. Each step either presents ONE packet to approve (packetAction set)
-   or is a pure wait/fork step with no packet (packetAction undefined). This
-   mirrors fedimint-playground's model: the user releases the network one
-   packet at a time, and every packet is inspectable before/after approval.
-   Two branches after the fork: happy path (buyer release, fee claim never
-   exists) and dispute path (timeout -> arbiter decision -> fee claim).
+     happy path   create → fork → sign (off-chain) → recipient submits → done
+     dispute path create → fork → timeout → engage → arbiter decides
+                    ├─ ruling:  arbiter submits the signed outcome → claims → done
+                    └─ silence: deadline → fallback
+                          ├─ Refund / Split:  claims → done
+                          └─ SwapArbiter (first time): back to "arbiter decides"
+                                with the replacement arbiter
+                                (second silence → fallback pays a Refund → claims → done)
    ============================================================================ */
 
 export type StepId =
     | "create"
     | "fork"
     | "happy-sign-relay"
-    | "happy-seller-submits"
+    | "happy-recipient-submits"
     | "wait-timeout"
-    | "dispute-sign-relay"
-    | "dispute-winner-submits"
-    | "fee-claim"
+    | "engage"
+    | "dispute-decide"
+    | "dispute-submit"
+    | "wait-resolution"
+    | "fallback"
+    | "claims"
     | "done";
 
 export interface ScriptStep {
@@ -541,229 +689,290 @@ export interface ScriptStep {
     eyebrow: string;
     title: string;
     body: string;
-    /** If set, this step's action is what gets packaged into a packet the user approves. */
-    packet?: {
-        from: PartyId;
-        to?: PartyId;
-        submits?: boolean;
-        kind: string;
-        packetTitle: string;
-        action: EscrowAction;
-    };
-    /** Steps with no packet are pure "continue"/fork beats (e.g. waiting, choosing). */
-    isWait?: boolean;
-    isTerminal?: boolean;
 }
 
 export const SCRIPT_STEPS: Record<StepId, ScriptStep> = {
     create: {
         id: "create",
-        eyebrow: "Step 1",
-        title: "Click the buyer's packet to create the contract",
+        eyebrow: "Step 1 — create the contract",
+        title: "The funder locks 100 sats in an escrow contract",
         body:
-            "Nothing exists yet. The buyer builds an Escrow Contract naming all three keys, the amount, arbiter_fee, and timeout. Click the parked packet below to inspect it, then approve it to send it to the federation. The federation responds with an operation_id confirming the contract is stored.",
-        packet: { from: "buyer", kind: "EscrowOutput", packetTitle: "Create escrow contract", action: { type: "BUYER_RELEASE", actor: "buyer", label: "__CREATE__", authRequired: "" } },
+            "Nothing exists yet. The contract names the funder, the recipient, the arbiter and the arbiter's fee key, plus the amount, the arbiter's fee, a timeout, a resolution period and a default fallback. Pick the default fallback — Refund, Split, or SwapArbiter (a replacement arbiter) — inspect the parked packet, then create the contract.",
     },
     fork: {
         id: "fork",
-        eyebrow: "Step 2 — the only live path",
-        title: "Right now, only the buyer can move these funds",
+        eyebrow: "Step 2 — who can move the funds?",
+        title: "Right now, only the funder can release the funds",
         body:
-            "After the successfull delivery of goods/services, the seller has no authority to release the contract locked funds without the buyer signatures. The arbiter's signature won't verify before teh timeout reaches.",
-        isWait: true,
+            "After the recipient delivers, the funder is the only one who can release the locked funds. The recipient has no authority to release them alone, and the arbiter isn't involved: they only come into play if a party engages them after the timeout. What happens next?",
     },
     "happy-sign-relay": {
         id: "happy-sign-relay",
         eyebrow: "Happy path — Step 3",
-        title: "Buyer signs, and hands the signature to the seller",
+        title: "The funder signs, and hands the signature to the recipient",
         body:
-            "This is not a federation transaction yet — it's an off-chain hand-off. outcome is hardcoded to Release for a buyer signature, so there's no field to tamper with. Approve it to watch the signature travel from buyer to seller.",
-        packet: {
-            from: "buyer",
-            to: "seller",
-            submits: false,
-            kind: "buyer_signature",
-            packetTitle: "Signed release, shared off-chain",
-            action: { type: "BUYER_RELEASE", actor: "buyer", label: "Buyer signs release to Seller", authRequired: "Buyer signature" },
-        },
+            "This is not a federation transaction yet — it's an off-chain hand-off. The funder signs a message that says 'release' (the outcome is hardcoded to Release, so there's nothing to tamper with) and sends the signature to the recipient. Approve it to watch it travel.",
     },
-    "happy-seller-submits": {
-        id: "happy-seller-submits",
+    "happy-recipient-submits": {
+        id: "happy-recipient-submits",
         eyebrow: "Happy path — Step 4",
-        title: "The seller wraps it and submits to the federation",
+        title: "The recipient submits the funder's signature",
         body:
-            "The seller is the one who actually submits the transaction, once they're holding a valid buyer signature. After the verification, federation pays the seller the full 100 ecash, and the escrow's locked balance goes to zero.",
-        packet: {
-            from: "seller",
-            kind: "EscrowInput",
-            packetTitle: "BuyerRelease → Seller",
-            action: { type: "BUYER_RELEASE", actor: "buyer", label: "Buyer signs release to Seller", authRequired: "Buyer signature" },
-        },
+            "Only the recipient can submit the release, since it pays them. The federation verifies the funder's signature, marks the contract Released and pays the recipient the full 100 sats in that same transaction — the escrow's locked balance drops to zero. No arbiter fee and nothing to claim: the arbiter was never involved.",
     },
     "wait-timeout": {
         id: "wait-timeout",
         eyebrow: "Dispute path — Step 3",
-        title: "The buyer stays silent. Advance the clock.",
-        body: "No packet is sent here — nothing happens automatically. Click to fast-forward past the timeout and watch the authority gate flip.",
-        isWait: true,
+        title: "The funder stays silent. Advance the clock.",
+        body:
+            "The recipient is still waiting. Nothing happens automatically, and the arbiter can't be engaged before the timeout. Fast-forward past it. (The funder's release still works after the timeout — the timeout doesn't revoke it, it only opens the door to the arbiter.)",
     },
-    "dispute-sign-relay": {
-        id: "dispute-sign-relay",
+    engage: {
+        id: "engage",
         eyebrow: "Dispute path — Step 4",
-        title: "The arbiter signs an outcome, and shares it with the winner",
+        title: "The recipient engages the arbiter",
         body:
-            "The arbiter never submits anything to the federation directly. They review evidence off-chain, sign a message covering the outcome, and hand that signature to whichever party won — here, choose the ruling and watch the signature travel to the winner.",
-        isWait: true,
+            "After the timeout, either party can engage the arbiter with a signed ArbiterEngaged request. The contract moves to Disputed and a resolution deadline (resolve_by) starts. From now on the funder's release is rejected. Off-chain, the recipient then sends their evidence to the arbiter.",
     },
-    "dispute-winner-submits": {
-        id: "dispute-winner-submits",
+    "dispute-decide": {
+        id: "dispute-decide",
         eyebrow: "Dispute path — Step 5",
-        title: "The winner submits the arbiter's signature",
+        title: "The arbiter decides — or stays silent",
         body:
-            "Holding a valid arbiter signature, the winning party builds the ArbiterOutcome resolution themselves and submits it. Approve it: the federation pays the winner amount − arbiter_fee, and a pending fee is set aside for the arbiter to collect separately.",
+            "The arbiter reviews the evidence off-chain. If they decide, they sign the outcome (release, refund or split) and submit it to the federation themselves — any party in the contract could submit it, but the arbiter is the natural one. If they stay silent until resolve_by, the contract's default fallback applies instead. What does the arbiter do?",
     },
-    "fee-claim": {
-        id: "fee-claim",
+    "dispute-submit": {
+        id: "dispute-submit",
         eyebrow: "Dispute path — Step 6",
-        title: "The arbiter sends a second, separate packet: the fee claim",
+        title: "The arbiter submits the signed ruling",
         body:
-            "This is not the same signature that resolved the dispute — it's a fresh signature over a different message (escrow_id + fee_amount), and the arbiter is the one who submits it themselves. Approve it to collect the fee.",
-        packet: {
-            from: "arbiter",
-            kind: "EscrowInput",
-            packetTitle: "ArbiterFeeClaim",
-            action: { type: "ARBITER_FEE_CLAIM", actor: "arbiter", label: "Arbiter claims their fee", authRequired: "Arbiter signature (fresh, over ArbiterFeeClaim message)" },
-        },
+            "The arbiter builds an ArbiterOutcome resolution around their own signature and submits it before resolve_by. The federation verifies it and settles the contract — but it pays nobody yet: it writes one claim pool for the winning side (both sides, on a split) that also includes the arbiter's fee. The funds stay locked until each claimant collects.",
+    },
+    "wait-resolution": {
+        id: "wait-resolution",
+        eyebrow: "Dispute path — Step 6",
+        title: "The arbiter never answers. Advance the clock.",
+        body:
+            "No outcome arrives. Fast-forward past resolve_by. Once it passes, the arbiter's window is closed for good — a late outcome would be rejected — and the default fallback opens.",
+    },
+    fallback: {
+        id: "fallback",
+        eyebrow: "Dispute path — Step 7",
+        title: "A party triggers the default fallback",
+        body:
+            "Either party can now submit ResolveFallbackPolicy. The contract settles by its default fallback and writes a claim pool without an arbiter fee: the arbiter didn't do the work, so they aren't paid.",
+    },
+    claims: {
+        id: "claims",
+        eyebrow: "Final step — claim the payouts",
+        title: "Each claimant collects their own share",
+        body:
+            "Resolving a dispute only writes the claim pool. Each claimant — the winning party (or both parties on a split) and, if an arbiter ruled, the arbiter for their fee — submits their own ClaimPayout, authorized by the key named in the pool. Nobody can claim someone else's share, and the order doesn't matter. Approve each claim in turn.",
     },
     done: {
         id: "done",
         eyebrow: "Walkthrough complete",
-        title: "You've now watched every packet this protocol sends",
-        body: "",
-        isTerminal: true,
+        title: "That's one full path through the protocol",
+        body:
+            "Start over to take another path — the happy path, the arbiter's ruling (release, refund or split), or a different default fallback (Refund, Split or SwapArbiter) when the arbiter stays silent — or use 'Try to break it' to see what the federation rejects.",
     },
 };
 
+/** Step text that depends on the contract's fallback and on whether the arbiter was already swapped. */
+export function scriptStep(id: StepId, state: EscrowState): ScriptStep {
+    const base = SCRIPT_STEPS[id];
+    switch (id) {
+        case "dispute-decide":
+            if (state.swapped) {
+                return {
+                    ...base,
+                    eyebrow: "After the swap — the replacement arbiter",
+                    title: "The replacement arbiter decides — or stays silent",
+                    body: `The first arbiter was swapped out. The active arbiter_key, arbiter_fee_key and fee (${state.swapArbiterFee} sats) are now the replacement's, and a fresh resolve_by is running. The replacement signs and submits an outcome — or stays silent, in which case the fallback now refunds with no fee, because a second swap is impossible. What does the replacement arbiter do?`,
+                };
+            }
+            return base;
+        case "wait-resolution":
+            if (state.swapped) {
+                return {
+                    ...base,
+                    eyebrow: "After the swap — Step 8",
+                    title: "The replacement arbiter never answers. Advance the clock.",
+                    body: "Fast-forward past the new resolve_by. The replacement's window closes, and there is no second swap: the fallback can only refund now.",
+                };
+            }
+            return base;
+        case "fallback":
+            if (swapAvailable(state)) {
+                return {
+                    ...base,
+                    title: "A party triggers the fallback — it swaps the arbiter",
+                    body: `The contract's default fallback is SwapArbiter. The module sees the swap is still available, so it does not pay anyone: it replaces the arbiter (new arbiter_key, arbiter_fee_key and a ${state.swapArbiterFee} sats fee) and keeps the contract Disputed with a fresh resolve_by and swapped: true.`,
+                };
+            }
+            if (state.swapped) {
+                return {
+                    ...base,
+                    eyebrow: "After the swap — Step 9",
+                    title: "A party triggers the fallback — it refunds",
+                    body: "The replacement arbiter missed the deadline too. The swap is already used, so ResolveFallbackPolicy now settles as a Refund with no arbiter fee. The funder gets the full amount through the claim pool.",
+                };
+            }
+            if (state.defaultFallback === "Split") {
+                return {
+                    ...base,
+                    body: "Either party can now submit ResolveFallbackPolicy. The contract settles by its default fallback — here, a 50 / 50 Split — and writes a claim pool without an arbiter fee: the arbiter didn't do the work, so they aren't paid.",
+                };
+            }
+            return {
+                ...base,
+                body: "Either party can now submit ResolveFallbackPolicy. The contract settles by its default fallback — here, Refund — and writes a claim pool without an arbiter fee: the arbiter didn't do the work, so they aren't paid.",
+            };
+        default:
+            return base;
+    }
+}
+
+export function packetForStep(stepId: StepId, state: EscrowState, ctx: { outcome: OutcomeType | null }): PacketDef | null {
+    switch (stepId) {
+        case "create":
+            return packetForAction("pk_create", { type: "CREATE_CONTRACT", actor: "funder" }, state);
+        case "happy-sign-relay":
+            return funderRelayPacket("pk_happy-sign-relay", state);
+        case "happy-recipient-submits":
+            return packetForAction("pk_happy-recipient-submits", { type: "FUNDER_RELEASE", actor: "recipient", signature: "valid" }, state);
+        case "engage":
+            return packetForAction("pk_engage", { type: "ENGAGE_ARBITER", actor: "recipient" }, state);
+        case "dispute-submit":
+            // The arbiter signs and submits their own outcome.
+            return ctx.outcome
+                ? packetForAction("pk_dispute-submit", { type: "ARBITER_OUTCOME", actor: "arbiter", outcome: ctx.outcome, signature: "valid" }, state)
+                : null;
+        case "fallback":
+            return packetForAction("pk_fallback", { type: "TRIGGER_FALLBACK", actor: "funder" }, state);
+        default:
+            return null;
+    }
+}
+
+/* ============================================================================
+   TRY TO BREAK IT
+   Each scenario is a real packet sent at a moment when the federation should
+   reject it for one specific reason. A button is only enabled while a dry run
+   of evaluateAction gives exactly that rejection (and `requires` holds), so it
+   always teaches what it says it teaches.
+   ============================================================================ */
+
+export interface BreakScenario {
+    id: string;
+    label: string;
+    /** When the scenario is available — shown under the button. */
+    hint: string;
+    action: EscrowAction;
+    expect: ErrorCode;
+    /** Extra availability condition on top of the dry run. */
+    requires?: (state: EscrowState) => boolean;
+}
+
+export const BREAK_SCENARIOS: BreakScenario[] = [
+    {
+        id: "forged-release",
+        label: "recipient: release with their own signature",
+        hint: "While the contract is Active",
+        action: { type: "FUNDER_RELEASE", actor: "recipient", signature: "forged" },
+        expect: "InvalidSignature",
+    },
+    {
+        id: "engage-early",
+        label: "recipient: engage the arbiter early",
+        hint: "Before the timeout",
+        action: { type: "ENGAGE_ARBITER", actor: "recipient" },
+        expect: "TimeoutNotReached",
+    },
+    {
+        id: "decide-early",
+        label: "Arbiter outcome before anyone engaged them",
+        hint: "While the contract is Active",
+        action: { type: "ARBITER_OUTCOME", actor: "arbiter", outcome: Outcome.RELEASE, signature: "valid" },
+        expect: "ContractNotDisputed",
+    },
+    {
+        id: "release-after-dispute",
+        label: "funder's release after the dispute opened",
+        hint: "While the contract is Disputed",
+        action: { type: "FUNDER_RELEASE", actor: "recipient", signature: "valid" },
+        expect: "ContractDisputed",
+    },
+    {
+        id: "forged-outcome",
+        label: "recipient submits a ruling with a forged arbiter signature",
+        hint: "While Disputed, before the deadline",
+        action: { type: "ARBITER_OUTCOME", actor: "recipient", outcome: Outcome.RELEASE, signature: "forged" },
+        expect: "InvalidSignature",
+    },
+    {
+        id: "stale-arbiter",
+        label: "Original arbiter rules after being swapped out",
+        hint: "After the swap, before the new deadline",
+        action: { type: "ARBITER_OUTCOME", actor: "arbiter", outcome: Outcome.RELEASE, signature: "stale" },
+        expect: "InvalidSignature",
+        requires: (s) => s.swapped,
+    },
+    {
+        id: "fallback-early",
+        label: "Trigger the fallback early",
+        hint: "While Disputed, before the deadline (also blocks a second swap)",
+        action: { type: "TRIGGER_FALLBACK", actor: "recipient" },
+        expect: "FallbackNotAvailable",
+    },
+    {
+        id: "decide-late",
+        label: "Arbiter outcome after the deadline",
+        hint: "After the resolution deadline",
+        action: { type: "ARBITER_OUTCOME", actor: "arbiter", outcome: Outcome.RELEASE, signature: "valid" },
+        expect: "ResolutionDeadlinePassed",
+    },
+    {
+        id: "release-again",
+        label: "Release again after it's resolved",
+        hint: "Once the contract is resolved",
+        action: { type: "FUNDER_RELEASE", actor: "recipient", signature: "valid" },
+        expect: "ContractAlreadyResolved",
+    },
+    {
+        id: "claim-nothing",
+        label: "Arbiter: claim a fee that isn't there",
+        hint: "When no arbiter fee is claimable",
+        action: { type: "CLAIM_PAYOUT", actor: "arbiter" },
+        expect: "NoPendingClaim",
+    },
+];
+
+export function breakScenarioAvailable(scenario: BreakScenario, state: EscrowState, now: number = Date.now()): boolean {
+    if (!state.created) return false;
+    if (scenario.requires && !scenario.requires(state)) return false;
+    return evaluateAction(state, scenario.action, now).error === scenario.expect;
+}
 
 /* ============================================================================
    TRUST MODEL CONTENT
-   Static content backing the Trust Model tab's can/cannot table and
-   assumptions cards.
    ============================================================================ */
-
-export interface TrustTableRow {
-    actor: string;
-    colorVar: string;
-    can: string;
-    cannot: string;
-}
-
-export const TRUST_TABLE: TrustTableRow[] = [
-    {
-        actor: "Buyer",
-        colorVar: "--color-blue",
-        can: "Authorize happy-path release with a signature, paying the seller the full amount",
-        cannot: "Arbitrarily take funds from the seller, or release after the dispute window has opened",
-    },
-    {
-        actor: "Seller",
-        colorVar: "--color-primary",
-        can: "Participate in the agreement; verify contract terms via escrow_id",
-        cannot: "Unilaterally withdraw escrowed funds under any circumstance — no Resolution variant exists for this",
-    },
-    {
-        actor: "Arbiter",
-        colorVar: "--color-warning",
-        can: "Authorize a dispute outcome after the timeout, then separately claim their fee with a second signature",
-        cannot: "Act before the timeout, sign an outcome different from the one declared in the message, or claim a fee that was never created",
-    },
-    {
-        actor: "Escrow module",
-        colorVar: "--color-dark",
-        can: "Verify signatures and enforce contract state transitions exactly once, including the separate fee-claim step",
-        cannot: "Determine whether a real-world event (delivery, quality, fraud) actually happened",
-    },
-];
 
 export interface TrustAssumption {
     to: string;
 }
 
 export const TRUST_ASSUMPTIONS: TrustAssumption[] = [
-    { to: "Buyer honestly signs Release service have been fulfilled, otherwise the seller may need to wait for timeout and arbitration." },
-    { to: "Arbiter makes a fair, evidence-based decision when a dispute is raised." },
-    { to: "Winning party of dispute cooperates in submitting the arbiter's signed decision; otherwise, the escrow and arbiter fee may remain unresolved." },
-    { to: "Seller fulfils the real-world obligation agreed outside the escrow; the protocol cannot verify delivery or service completion." },
+    { to: "The funder honestly signs the release once the goods or service have been delivered. Otherwise the recipient has to wait for the timeout and engage the arbiter." },
+    { to: "The recipient fulfils the real-world obligation agreed outside the escrow. The protocol can't verify delivery or service completion." },
+    { to: "The arbiter makes a fair, evidence-based decision, signs it, and submits it before the resolution deadline. Any party could submit the signed ruling, but if nobody does, the window closes and the fallback applies — without an arbiter fee." },
+    { to: "If the contract's fallback is SwapArbiter, the replacement arbiter named at creation is trusted too. The swap happens only once, so a silent arbiter can delay a dispute by one extra window — after that the contract refunds." },
+    { to: "The federation's guardians run the module honestly. The escrow rules are enforced by federation consensus, so you inherit the federation's trust assumption — no more." },
 ];
 
 export const NOT_REQUIRED: string[] = [
-    "Real-world identities of buyer, seller, or arbiter",
+    "Real-world identities of funder, recipient, or arbiter",
     "The contents or substance of the dispute",
     "Whether the physical or digital good was actually delivered",
     "Why the arbiter decided the way it did",
-];
-
-/* ============================================================================
-   ARCHITECTURE ESSAY CONTENT
-   Prose meant to let a reader locate their own use case against the
-   architecture's actual shape, without being asked anything — no fit-check
-   questionnaire, just a clear-eyed account of the guarantees, edges, and
-   composability of the design.
-   ============================================================================ */
-
-export interface EssaySection {
-    id: string;
-    heading: string;
-    paragraphs: string[];
-}
-
-export const ARCHITECTURE_ESSAY: EssaySection[] = [
-    {
-        id: "guarantees",
-        heading: "What this architecture actually guarantees",
-        paragraphs: [
-            "Three things are enforced by consensus code, not by anyone's good behavior. A contract's terms can't change after creation — they're baked into contract_hash, and the module independently recomputes and checks that hash before it will store the contract at all. A resolution can't be replayed or redirected — the signed message binds federation_id, escrow_id, the outcome, and contract_hash together, so a signature produced for one contract or one outcome fails verification anywhere else. And a resolved contract can never be spent twice — status moves from Active to a terminal state and stays there.",
-            "That's narrower than 'the escrow is secure.' It's closer to: whatever authorization rule you agreed to at creation time is the one that gets enforced, exactly, with no room for a party to renegotiate it later by pressuring the module.",
-        ],
-    },
-    {
-        id: "outside",
-        heading: "What's deliberately left outside the protocol",
-        paragraphs: [
-            "The module has no opinion on whether a delivery happened, whether goods matched description, or who was telling the truth in a dispute. It only ever answers one question: does this signature verify, for this contract, for this declared outcome, at this time? The arbiter's judgment is a black box to the code — evidence, conversation, and reasoning all happen off-chain, and the module enforces the result without inspecting how it was reached.",
-            "This is a design choice, not a limitation waiting to be fixed. Encoding 'did delivery happen' into consensus code would mean the federation adjudicating real-world facts — a much bigger, different, and generally undesirable thing for a federation of guardians to be doing.",
-        ],
-    },
-    {
-        id: "fee-model",
-        heading: "Why the arbiter fee is a separate step, not a side effect",
-        paragraphs: [
-            "It would be simpler for the module to just pay the arbiter their fee at the same moment it pays out the winner. Instead, an arbiter decision only writes a pending-fee record — the arbiter has to come back with a second, independently-verified signature to actually collect it. Structurally, this keeps the resolution transaction's job narrow (verify one signature, move funds to one winner) rather than bundling a second unrelated payout into it.",
-            "It also means the fee genuinely doesn't exist as a concept on the buyer-release path. If the buyer signs happily before any dispute, the arbiter was never part of that transaction, so there's no pending record for them to claim later — a small but precise reflection of the principle that the arbiter is only paid for work they were actually asked to do.",
-        ],
-    },
-    {
-        id: "fits",
-        heading: "Where this shape tends to fit",
-        paragraphs: [
-            "It fits naturally wherever you already have — or are willing to designate — some accountable party who can look at evidence and make a call, and where you're comfortable with that call being final once made. Freelance and marketplace payments, peer-to-peer trades, and any workflow with a natural mediator (a platform operator, a guild, a trusted intermediary) all match this shape well, because the hard part — judgment — was going to live off-chain regardless of what protocol you used.",
-            "It also fits well anywhere the timeout is doing useful work: a buyer who goes silent shouldn't be able to freeze funds forever, and a seller shouldn't be able to force early arbitration before the buyer's had a fair window to just release the funds happily. The pre-timeout / post-timeout split exists specifically so the fast path stays fast and the slow path only opens once the fast path has had its chance.",
-        ],
-    },
-    {
-        id: "doesnt-fit",
-        heading: "Where it doesn't fit",
-        paragraphs: [
-            "If your application needs the protocol itself to verify that a real-world event occurred — proof of delivery from a shipping API, an oracle-fed price at settlement, a cryptographic proof of work performed — this module doesn't do that, and bolting it on would mean adding exactly the kind of real-world-fact verification the design intentionally avoids. That's a different module, likely built around an oracle or attestation scheme, not this one.",
-            "It also doesn't fit if a single arbiter having unilateral, unappealable authority over the outcome is unacceptable for your use case — today there's exactly one arbiter_key, one signature, one decision, with no on-protocol appeal step. If the dispute decision itself needs agreement among several parties rather than trust in one, you need multi-party authorization at the signing layer, which this contract shape doesn't yet provide.",
-        ],
-    },
-    {
-        id: "extends",
-        heading: "How it composes and where it stops",
-        paragraphs: [
-            "The arbiter side of this is a single key today, but the signature-verification boundary is exactly where a threshold or multi-arbiter scheme would plug in — the module doesn't care how arbiter_key's signature got produced, only that it verifies. A key held by an actual committee behind the scenes, or a proper threshold signing scheme, is a change to how that one key is produced, not a change to the module's consensus logic.",
-            "What doesn't compose as cleanly is stacking additional off-chain policy — reputation systems, appeal processes, weighted votes — directly into this module. Those are policy layers that sit above a settlement primitive like this one; encoding them into the consensus code would mean the federation enforcing business logic it has no way to evaluate, which runs against the whole premise of keeping the module's job narrow: verify signatures, enforce transitions, know nothing else.",
-        ],
-    },
 ];
